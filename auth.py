@@ -14,10 +14,9 @@ def _get_client() -> Optional[Client]:
 
 
 def _save_session(session):
-    """Persist tokens. Query params survive tab refresh, not browser close."""
-    if session:
+    """Persist refresh token to query params for session restoration."""
+    if session and session.refresh_token:
         try:
-            st.query_params["sb_at"] = session.access_token
             st.query_params["sb_rt"] = session.refresh_token
         except Exception:
             pass
@@ -38,14 +37,14 @@ def restore_session() -> bool:
     if not client:
         return False
     try:
-        refresh = st.query_params.get("sb_rt")
-        access = st.query_params.get("sb_at")
+        refresh_token = st.query_params.get("sb_rt")
     except Exception:
         return False
-    if not refresh or not access:
+    if not refresh_token:
         return False
     try:
-        res = client.auth.set_session(access, refresh)
+        # 用 refresh token 换取全新 session，不依赖可能已过期的 access token
+        res = client.auth.refresh_session(refresh_token)
         if res.user:
             st.session_state.user = res.user
             st.session_state.session = res.session
