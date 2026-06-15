@@ -5,9 +5,27 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auth
 import db
-from app import clean_numeric_cols, enrich_time_cols
 
 st.set_page_config(page_title="管理后台", page_icon="🔧", layout="wide")
+
+
+def parse_wan(val):
+    if pd.isna(val):
+        return 0
+    s = str(val).strip()
+    if "万" in s:
+        return int(float(s.replace("万", "")) * 10000)
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+
+def clean_numeric_cols(df, cols):
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].apply(parse_wan)
+    return df
 
 # 门禁：仅 admin
 if not auth.is_logged_in() or not auth.is_admin():
