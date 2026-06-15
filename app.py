@@ -86,89 +86,49 @@ def _get_font_path():
 
 
 # ==================== 侧边栏 ====================
-uploaded_contents = None
-uploaded_comments = None
-
 with st.sidebar:
-    st.header("📂 数据加载")
+    st.header("📂 数据管理")
 
-    # ---- CSV 加载（始终可见）----
-    with st.expander("📄 从 CSV 加载", expanded=True):
-        if auth.is_admin():
-            uploaded_contents = st.file_uploader("上传 search_contents CSV", type="csv", key="uc")
-            uploaded_comments = st.file_uploader("上传 search_comments CSV (可选)", type="csv", key="ucm")
+    # ---- 自动连接 Supabase + 加载数据 ----
+    if "contents" not in st.session_state:
+        with st.spinner("连接 Supabase..."):
+            client = db.connect()
+            if not client:
+                st.error("Supabase 未配置，请设置 SUPABASE_URL 和 SUPABASE_ANON_KEY")
+                st.stop()
+            st.session_state.db_conn = client
+            stats = db.table_stats(client)
+            st.session_state.db_stats = stats
+            st.session_state.contents = enrich_time_cols(db.query_contents(client))
+            st.session_state.contents = clean_numeric_cols(st.session_state.contents, ["liked_count", "collected_count", "comment_count", "share_count"])
+            comments_data = db.query_comments(client)
+            comments_data = clean_numeric_cols(comments_data, ["like_count", "sub_comment_count"])
+            comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
+            st.session_state.comments = comments_data
 
-            if st.button("加载 6-11 默认数据", use_container_width=True):
-                contents = pd.read_csv("6-11/search_contents_2026-06-11.csv")
+    st.info(f"📊 帖子 {st.session_state.db_stats['contents']} 条 | 评论 {st.session_state.db_stats['comments']} 条")
+
+    # ---- Admin: CSV 导入到 Supabase ----
+    if auth.is_admin():
+        with st.expander("📥 导入 CSV 到数据库", expanded=False):
+            uploaded_contents = st.file_uploader("上传 search_contents CSV", type="csv")
+            uploaded_comments = st.file_uploader("上传 search_comments CSV (可选)", type="csv")
+            if uploaded_contents and st.button("导入入库", use_container_width=True):
+                contents = pd.read_csv(uploaded_contents)
                 contents = clean_numeric_cols(contents, ["liked_count", "collected_count", "comment_count", "share_count"])
-                st.session_state.contents = enrich_time_cols(contents)
-                comments = pd.read_csv("6-11/search_comments_2026-06-11.csv")
-                comments = clean_numeric_cols(comments, ["like_count", "sub_comment_count"])
-                comments["create_time_dt"] = pd.to_datetime(comments["create_time"], unit="ms")
-                st.session_state.comments = comments
-                st.success("数据已加载")
-                st.rerun()
-        else:
-            st.info("🔒 上传数据需管理员权限")
-
-    # ---- 数据库（始终可见）----
-    with st.expander("🗄️ 数据库", expanded=False):
-        if auth.is_admin():
-            db_path = st.text_input("DB 路径", "data/xhs_crawler.db", key="dbp")
-            st.session_state.db_path = db_path
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if auth.is_admin() and st.button("连接数据库", use_container_width=True):
-                try:
-                    conn = db.connect(db_path)
-                    db.init_db(conn)
-                    stats = db.table_stats(conn)
-                    st.session_state.db_conn = conn
-                    st.session_state.db_stats = stats
-                    st.success("已连接")
-                except Exception as e:
-                    st.error(f"连接失败: {e}")
-        with col2:
-            if st.button("从库加载", use_container_width=True):
-                if "db_conn" not in st.session_state:
-                    # Auto-connect for viewers
-                    conn = db.connect()
-                    if conn:
-                        st.session_state.db_conn = conn
-                        stats = db.table_stats(conn)
-                        st.session_state.db_stats = stats
-                    else:
-                        st.error("数据库未配置")
-                        st.stop()
-                st.session_state.contents = enrich_time_cols(db.query_contents(st.session_state.db_conn))
-                st.session_state.contents = clean_numeric_cols(st.session_state.contents, ["liked_count", "collected_count", "comment_count", "share_count"])
-                comments = db.query_comments(st.session_state.db_conn)
-                comments = clean_numeric_cols(comments, ["like_count", "sub_comment_count"])
-                comments["create_time_dt"] = pd.to_datetime(comments["create_time"], unit="ms")
-                st.session_state.comments = comments
-                st.success("已从数据库加载")
-                st.rerun()
-
-        if "db_conn" in st.session_state and "db_stats" in st.session_state:
-            st.info(f"📊 帖子 {st.session_state.db_stats['contents']} 条 | 评论 {st.session_state.db_stats['comments']} 条")
-
-        if auth.is_admin() and st.button("📥 导入当前数据入库", use_container_width=True):
-            if "contents" not in st.session_state:
-                st.error("请先在上方 CSV 区域加载数据")
-            elif "db_conn" not in st.session_state:
-                st.error("请先连接数据库")
-            else:
-                n1 = db.import_contents(st.session_state.db_conn, st.session_state.contents)
-                n2 = 0
-                if "comments" in st.session_state and st.session_state.comments is not None:
-                    n2 = db.import_comments(st.session_state.db_conn, st.session_state.comments)
+                n1 = db.import_contents(st.session_state.db_conn, contents)
+                if uploaded_comments:
+                    coms = pd.read_csv(uploaded_comments)
+                    coms = clean_numeric_cols(coms, ["like_count", "sub_comment_count"])
+                    n2 = db.import_comments(st.session_state.db_conn, coms)
+                else:
+                    n2 = 0
                 stats = db.table_stats(st.session_state.db_conn)
                 st.session_state.db_stats = stats
-                st.success(f"导入完成：帖子 {n1} 条，评论 {n2} 条")
-
-    st.divider()
-    datasource = st.radio("看板数据源", ["CSV", "数据库"], horizontal=True)
+                # Reload
+                st.session_state.pop("contents", None)
+                st.success(f"导入：帖子 {n1} 条，评论 {n2} 条 → 刷新看板")
+                st.rerun()
 
     st.divider()
     st.caption(f"👤 {auth.get_current_user().email}")
@@ -176,22 +136,6 @@ with st.sidebar:
     if st.button("🚪 登出", use_container_width=True):
         auth.logout()
         st.rerun()
-
-# 处理上传 CSV 文件
-if uploaded_contents:
-
-    contents = pd.read_csv(uploaded_contents)
-    contents = clean_numeric_cols(contents, ["liked_count", "collected_count", "comment_count", "share_count"])
-    st.session_state.contents = enrich_time_cols(contents)
-if uploaded_comments:
-    comments = pd.read_csv(uploaded_comments)
-    comments = clean_numeric_cols(comments, ["like_count", "sub_comment_count"])
-    comments["create_time_dt"] = pd.to_datetime(comments["create_time"], unit="ms")
-    st.session_state.comments = comments
-
-if "contents" not in st.session_state:
-    st.info("👈 请从侧边栏加载数据")
-    st.stop()
 
 df = st.session_state.contents
 comments = st.session_state.comments if "comments" in st.session_state else None
