@@ -1,0 +1,6 @@
+{
+  "sqlite.enable": true,
+  "sqlite.databaseExtensions": ["db", "sqlite", "sqlite3"],
+  "sqlite.openDatabaseMode": "persistent",
+  "sqlite.showExplorer": true
+}
