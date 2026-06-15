@@ -108,27 +108,9 @@ with st.sidebar:
 
     st.info(f"📊 帖子 {st.session_state.db_stats['contents']} 条 | 评论 {st.session_state.db_stats['comments']} 条")
 
-    # ---- Admin: CSV 导入到 Supabase ----
+    # ---- Admin 入口 ----
     if auth.is_admin():
-        with st.expander("📥 导入 CSV 到数据库", expanded=False):
-            uploaded_contents = st.file_uploader("上传 search_contents CSV", type="csv")
-            uploaded_comments = st.file_uploader("上传 search_comments CSV (可选)", type="csv")
-            if uploaded_contents and st.button("导入入库", use_container_width=True):
-                contents = pd.read_csv(uploaded_contents)
-                contents = clean_numeric_cols(contents, ["liked_count", "collected_count", "comment_count", "share_count"])
-                n1 = db.import_contents(st.session_state.db_conn, contents)
-                if uploaded_comments:
-                    coms = pd.read_csv(uploaded_comments)
-                    coms = clean_numeric_cols(coms, ["like_count", "sub_comment_count"])
-                    n2 = db.import_comments(st.session_state.db_conn, coms)
-                else:
-                    n2 = 0
-                stats = db.table_stats(st.session_state.db_conn)
-                st.session_state.db_stats = stats
-                # Reload
-                st.session_state.pop("contents", None)
-                st.success(f"导入：帖子 {n1} 条，评论 {n2} 条 → 刷新看板")
-                st.rerun()
+        st.page_link("pages/admin.py", label="🔧 管理后台", icon="🔧")
 
     st.divider()
     st.caption(f"👤 {auth.get_current_user().email}")
