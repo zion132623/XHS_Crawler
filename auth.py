@@ -6,9 +6,6 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-COOKIE_ACCESS = "sb_access_token"
-COOKIE_REFRESH = "sb_refresh_token"
-
 
 def _get_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -17,28 +14,25 @@ def _get_client() -> Optional[Client]:
 
 
 def _save_session(session):
-    """Persist session tokens to cookies so refresh doesn't log out."""
+    """Persist session tokens to query params so refresh doesn't log out."""
     if session:
-        st.cookies[COOKIE_ACCESS] = session.access_token
-        st.cookies[COOKIE_REFRESH] = session.refresh_token
+        st.query_params["sb_at"] = session.access_token
+        st.query_params["sb_rt"] = session.refresh_token
 
 
-def _clear_cookies():
-    if COOKIE_ACCESS in st.cookies:
-        st.cookies[COOKIE_ACCESS] = ""
-    if COOKIE_REFRESH in st.cookies:
-        st.cookies[COOKIE_REFRESH] = ""
+def _clear_session_params():
+    st.query_params.clear()
 
 
 def restore_session() -> bool:
-    """Try to restore Supabase session from cookies. Call once on app start."""
+    """Try to restore Supabase session from query params. Call once on app start."""
     if "user" in st.session_state:
         return True
     client = _get_client()
     if not client:
         return False
-    refresh = st.cookies.get(COOKIE_REFRESH)
-    access = st.cookies.get(COOKIE_ACCESS)
+    refresh = st.query_params.get("sb_rt")
+    access = st.query_params.get("sb_at")
     if not refresh or not access:
         return False
     try:
@@ -51,7 +45,7 @@ def restore_session() -> bool:
             _save_session(res.session)
             return True
     except Exception:
-        _clear_cookies()
+        _clear_session_params()
     return False
 
 
@@ -91,7 +85,7 @@ def register(email: str, password: str) -> Optional[dict]:
 def logout():
     for key in ["user", "session", "role"]:
         st.session_state.pop(key, None)
-    _clear_cookies()
+    _clear_session_params()
     st.rerun()
 
 
