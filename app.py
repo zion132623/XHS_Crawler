@@ -135,7 +135,9 @@ with st.sidebar:
     # 互动量阈值
     min_likes = int(df["liked_count"].min())
     max_likes = int(df["liked_count"].max())
-    like_range = st.slider("点赞数范围", min_likes, max_likes, (min_likes, max_likes))
+    if min_likes >= max_likes:
+        min_likes = max_likes - 1
+    like_range = st.slider("点赞数范围", min_likes - 100, max_likes + 100, (min_likes, max_likes))
 
     # 帖子类型
     types = st.multiselect("帖子类型", df["type"].unique().tolist(), default=df["type"].unique().tolist())

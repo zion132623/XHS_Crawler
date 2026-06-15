@@ -21,11 +21,16 @@ def parse_wan(val):
         return 0
 
 
+def _read_csv(file):
+    return pd.read_csv(file, encoding="utf-8-sig", engine="python")
+
+
 def clean_numeric_cols(df, cols):
     for col in cols:
         if col in df.columns:
             df[col] = df[col].apply(parse_wan)
     return df
+
 
 # 门禁：仅 admin
 if not auth.is_logged_in() or not auth.is_admin():
@@ -60,7 +65,6 @@ with tab1:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("清空全部帖子", type="secondary"):
-            # Delete via Supabase REST (need to do it in batches)
             try:
                 data = client.table("contents").select("note_id").execute()
                 ids = [r["note_id"] for r in (data.data or [])]
@@ -104,19 +108,23 @@ with tab2:
 
 with tab3:
     st.subheader("导入 CSV 到 Supabase")
-    uploaded_c = st.file_uploader("上传 search_contents CSV", type="csv")
-    uploaded_cm = st.file_uploader("上传 search_comments CSV (可选)", type="csv")
+    uploaded_c = st.file_uploader("上传 search_contents CSV", type="csv", key="admin_csv_c")
+    uploaded_cm = st.file_uploader("上传 search_comments CSV (可选)", type="csv", key="admin_csv_cm")
 
-    if uploaded_c and st.button("导入入库", type="primary"):
-        contents = pd.read_csv(uploaded_c)
-        contents = clean_numeric_cols(contents, ["liked_count", "collected_count", "comment_count", "share_count"])
-        n1 = db.import_contents(client, contents)
+    if st.button("导入入库", type="primary"):
+        if not uploaded_c:
+            st.error("请先上传 search_contents CSV")
+        else:
+            contents = _read_csv(uploaded_c)
+            contents = clean_numeric_cols(contents, ["liked_count", "collected_count", "comment_count", "share_count"])
+            r1 = db.import_contents(client, contents)
 
-        n2 = 0
-        if uploaded_cm:
-            coms = pd.read_csv(uploaded_cm)
-            coms = clean_numeric_cols(coms, ["like_count", "sub_comment_count"])
-            n2 = db.import_comments(client, coms)
+            r2 = {"inserted": 0, "updated": 0}
+            if uploaded_cm:
+                coms = _read_csv(uploaded_cm)
+                coms = clean_numeric_cols(coms, ["like_count", "sub_comment_count"])
+                r2 = db.import_comments(client, coms)
 
-        st.session_state.db_stats = db.table_stats(client)
-        st.success(f"导入：帖子 {n1} 条，评论 {n2} 条")
+            st.session_state.db_stats = db.table_stats(client)
+            c1 = r1["inserted"]; u1 = r1["updated"]; c2 = r2["inserted"]; u2 = r2["updated"]
+            st.success(f"帖子: 新增 {c1} 条, 更新 {u1} 条 | 评论: 新增 {c2} 条, 更新 {u2} 条")

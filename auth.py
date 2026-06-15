@@ -14,14 +14,20 @@ def _get_client() -> Optional[Client]:
 
 
 def _save_session(session):
-    """Persist session tokens to query params so refresh doesn't log out."""
+    """Persist tokens. Query params survive tab refresh, not browser close."""
     if session:
-        st.query_params["sb_at"] = session.access_token
-        st.query_params["sb_rt"] = session.refresh_token
+        try:
+            st.query_params["sb_at"] = session.access_token
+            st.query_params["sb_rt"] = session.refresh_token
+        except Exception:
+            pass
 
 
 def _clear_session_params():
-    st.query_params.clear()
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
 
 
 def restore_session() -> bool:
@@ -31,8 +37,11 @@ def restore_session() -> bool:
     client = _get_client()
     if not client:
         return False
-    refresh = st.query_params.get("sb_rt")
-    access = st.query_params.get("sb_at")
+    try:
+        refresh = st.query_params.get("sb_rt")
+        access = st.query_params.get("sb_at")
+    except Exception:
+        return False
     if not refresh or not access:
         return False
     try:
