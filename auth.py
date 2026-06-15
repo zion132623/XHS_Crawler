@@ -24,8 +24,10 @@ def _save_session(session):
 
 
 def _clear_cookies():
-    st.cookies.pop(COOKIE_ACCESS, None)
-    st.cookies.pop(COOKIE_REFRESH, None)
+    if COOKIE_ACCESS in st.cookies:
+        st.cookies[COOKIE_ACCESS] = ""
+    if COOKIE_REFRESH in st.cookies:
+        st.cookies[COOKIE_REFRESH] = ""
 
 
 def restore_session() -> bool:
