@@ -6,11 +6,51 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
+COOKIE_ACCESS = "sb_access_token"
+COOKIE_REFRESH = "sb_refresh_token"
+
 
 def _get_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         return None
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+
+def _save_session(session):
+    """Persist session tokens to cookies so refresh doesn't log out."""
+    if session:
+        st.cookies[COOKIE_ACCESS] = session.access_token
+        st.cookies[COOKIE_REFRESH] = session.refresh_token
+
+
+def _clear_cookies():
+    st.cookies.pop(COOKIE_ACCESS, None)
+    st.cookies.pop(COOKIE_REFRESH, None)
+
+
+def restore_session() -> bool:
+    """Try to restore Supabase session from cookies. Call once on app start."""
+    if "user" in st.session_state:
+        return True
+    client = _get_client()
+    if not client:
+        return False
+    refresh = st.cookies.get(COOKIE_REFRESH)
+    access = st.cookies.get(COOKIE_ACCESS)
+    if not refresh or not access:
+        return False
+    try:
+        res = client.auth.set_session(access, refresh)
+        if res.user:
+            st.session_state.user = res.user
+            st.session_state.session = res.session
+            role = get_user_role(res.user.id)
+            st.session_state.role = role
+            _save_session(res.session)
+            return True
+    except Exception:
+        _clear_cookies()
+    return False
 
 
 def login(email: str, password: str) -> Optional[dict]:
@@ -25,6 +65,7 @@ def login(email: str, password: str) -> Optional[dict]:
             st.session_state.session = res.session
             role = get_user_role(res.user.id)
             st.session_state.role = role
+            _save_session(res.session)
             return res.user
     except Exception as e:
         st.error(f"登录失败: {e}")
@@ -48,6 +89,8 @@ def register(email: str, password: str) -> Optional[dict]:
 def logout():
     for key in ["user", "session", "role"]:
         st.session_state.pop(key, None)
+    _clear_cookies()
+    st.rerun()
 
 
 def get_current_user() -> Optional[dict]:

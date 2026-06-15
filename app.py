@@ -15,6 +15,9 @@ import auth
 st.set_page_config(page_title="XHS 数据看板", page_icon="📊", layout="wide")
 st.title("📊 小红书「原创车贴」数据看板")
 
+# ==================== 会话恢复 ====================
+auth.restore_session()
+
 # ==================== 登录门禁 ====================
 if not auth.is_logged_in():
     col_form, col_space = st.columns([1, 1.5])
