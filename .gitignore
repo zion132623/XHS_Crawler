@@ -12,5 +12,8 @@ wheels/
 # Secrets
 .env
 
+# Data files
+6-11/
+
 # OS files
 .DS_Store
