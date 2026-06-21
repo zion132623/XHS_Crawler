@@ -7,9 +7,8 @@ import auth
 
 st.set_page_config(page_title="停用词管理", page_icon="📝", layout="wide")
 
-# Admin only
-if not auth.is_logged_in() or not auth.is_admin():
-    st.error("无权访问")
+if not auth.is_logged_in():
+    st.error("请先登录")
     st.stop()
 
 st.title("📝 停用词管理")

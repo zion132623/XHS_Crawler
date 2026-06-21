@@ -116,9 +116,10 @@ with st.sidebar:
         f"| 评论 {st.session_state.db_stats['comments']} 条"
     )
 
+    st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
+
     if auth.is_admin():
         st.page_link("pages/admin.py", label="🔧 管理后台", icon="🔧")
-        st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
 
     st.divider()
     st.caption(f"👤 {auth.get_current_user().email}")
