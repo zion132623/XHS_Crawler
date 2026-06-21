@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from wordcloud import WordCloud
 from collections import Counter
 import jieba
+import math
 import re
 from datetime import datetime
 from dotenv import load_dotenv
@@ -12,8 +13,8 @@ load_dotenv()
 import db
 import auth
 
-st.set_page_config(page_title="XHS 数据看板", page_icon="📊", layout="wide")
-st.title("📊 小红书「原创车贴」数据看板")
+st.set_page_config(page_title="XHS 运营分析", page_icon="📊", layout="wide")
+st.title("📊 小红书「原创车贴」运营分析")
 
 # ==================== 会话恢复 ====================
 auth.restore_session()
@@ -23,29 +24,21 @@ if not auth.is_logged_in():
     col_form, col_space = st.columns([1, 1.5])
     with col_form:
         st.subheader("🔐 登录")
-        login_tab, reg_tab = st.tabs(["登录", "注册"])
-        with login_tab:
-            email = st.text_input("邮箱", key="login_email")
-            password = st.text_input("密码", type="password", key="login_pw")
-            if st.button("登录", use_container_width=True):
-                auth.login(email, password)
-                st.rerun()
-        with reg_tab:
-            reg_email = st.text_input("邮箱", key="reg_email")
-            reg_pw = st.text_input("密码", type="password", key="reg_pw")
-            if st.button("注册", use_container_width=True):
-                auth.register(reg_email, reg_pw)
+        email = st.text_input("邮箱", key="login_email")
+        password = st.text_input("密码", type="password", key="login_pw")
+        if st.button("登录", use_container_width=True):
+            auth.login(email, password)
+            st.rerun()
     st.stop()
 
-# ==================== 辅助函数 ====================
+
+# ==================== 工具函数 ====================
 def parse_wan(val):
-    """Convert '3.9万' → 39000, '1万' → 10000, keep pure numbers."""
     if pd.isna(val):
         return 0
     s = str(val).strip()
     if "万" in s:
-        num = float(s.replace("万", ""))
-        return int(num * 10000)
+        return int(float(s.replace("万", "")) * 10000)
     try:
         return int(float(s))
     except (ValueError, TypeError):
@@ -53,7 +46,6 @@ def parse_wan(val):
 
 
 def clean_numeric_cols(df, cols):
-    """Apply parse_wan to each column and cast to int."""
     for col in cols:
         if col in df.columns:
             df[col] = df[col].apply(parse_wan)
@@ -64,13 +56,12 @@ def enrich_time_cols(df):
     df["publish_time"] = pd.to_datetime(df["time"], unit="ms")
     df["update_time"] = pd.to_datetime(df["last_update_time"], unit="ms")
     df["publish_hour"] = df["publish_time"].dt.hour
-    df["publish_weekday"] = df["publish_time"].dt.day_name()
+    df["publish_weekday"] = df["publish_time"].dt.weekday  # 0=Mon
     df["publish_date"] = df["publish_time"].dt.date
     return df
 
 
 def _get_font_path():
-    """Return a Chinese-compatible font path for the current OS."""
     import platform, os
     if platform.system() == "Darwin":
         return "/System/Library/Fonts/PingFang.ttc"
@@ -89,28 +80,36 @@ def _get_font_path():
 with st.sidebar:
     st.header("📂 数据管理")
 
-    # ---- 自动连接 Supabase + 加载数据 ----
-    if "contents" not in st.session_state:
+    if "xhs_note" not in st.session_state:
         with st.spinner("连接 Supabase..."):
             client = db.connect()
             if not client:
-                st.error("Supabase 未配置，请设置 SUPABASE_URL 和 SUPABASE_ANON_KEY")
+                st.error("Supabase 未配置")
                 st.stop()
             st.session_state.db_conn = client
             stats = db.table_stats(client)
             st.session_state.db_stats = stats
-            st.session_state.contents = enrich_time_cols(db.query_contents(client))
-            st.session_state.contents = clean_numeric_cols(st.session_state.contents, ["liked_count", "collected_count", "comment_count", "share_count"])
+            st.session_state.xhs_note = enrich_time_cols(db.query_contents(client))
+            st.session_state.xhs_note = clean_numeric_cols(
+                st.session_state.xhs_note,
+                ["liked_count", "collected_count", "comment_count", "share_count"],
+            )
             comments_data = db.query_comments(client)
             comments_data = clean_numeric_cols(comments_data, ["like_count", "sub_comment_count"])
             comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
             st.session_state.comments = comments_data
+            st.session_state.hot_all = db.query_hot_posts(client)
+            st.session_state.hot_normal = db.query_hot_posts(client, post_type="normal")
+            st.session_state.hot_video = db.query_hot_posts(client, post_type="video")
 
-    st.info(f"📊 帖子 {st.session_state.db_stats['contents']} 条 | 评论 {st.session_state.db_stats['comments']} 条")
+    st.info(
+        f"📊 帖子 {st.session_state.db_stats.get('xhs_note', 0)} 条 "
+        f"| 评论 {st.session_state.db_stats['comments']} 条"
+    )
 
-    # ---- Admin 入口 ----
     if auth.is_admin():
         st.page_link("pages/admin.py", label="🔧 管理后台", icon="🔧")
+        st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
 
     st.divider()
     st.caption(f"👤 {auth.get_current_user().email}")
@@ -119,226 +118,488 @@ with st.sidebar:
         auth.logout()
         st.rerun()
 
-df = st.session_state.contents
+df = st.session_state.xhs_note
 comments = st.session_state.comments if "comments" in st.session_state else None
-
-# ==================== 筛选器 ====================
-with st.sidebar:
-    st.header("🎛️ 筛选器")
-
-    # 日期范围
-    if "publish_date" in df.columns:
-        min_date = df["publish_date"].min()
-        max_date = df["publish_date"].max()
-        date_range = st.date_input("发布时间范围", [min_date, max_date])
-
-    # 互动量阈值
-    min_likes = int(df["liked_count"].min())
-    max_likes = int(df["liked_count"].max())
-    if min_likes >= max_likes:
-        min_likes = max_likes - 1
-    like_range = st.slider("点赞数范围", min_likes - 100, max_likes + 100, (min_likes, max_likes))
-
-    # 帖子类型
-    types = st.multiselect("帖子类型", df["type"].unique().tolist(), default=df["type"].unique().tolist())
-
-    # 时间粒度
-    time_granularity = st.selectbox("时间粒度", ["小时", "星期", "日期"], index=2)
-
-# 应用筛选
-mask = (
-    df["liked_count"].between(like_range[0], like_range[1]) &
-    df["type"].isin(types)
-)
-if "publish_date" in df.columns and len(date_range) == 2:
-    mask &= df["publish_date"].between(date_range[0], date_range[1])
-
-filtered_df = df[mask]
+hot_all = st.session_state.get("hot_all")
 
 # ==================== Tab 页 ====================
-tab1, tab2, tab3, tab4 = st.tabs(["📋 数据概览", "☁️ 词云分析", "⏰ 时间分析", "💬 评论分析"])
+tab_hot, tab_time, tab_content, tab_comments = st.tabs(
+    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "💬 评论分析"]
+)
 
-# ==================== Tab 1: 数据概览 ====================
-with tab1:
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("帖子数", len(filtered_df))
-    col2.metric("总点赞", f"{filtered_df['liked_count'].sum():,}")
-    col3.metric("总评论", f"{filtered_df['comment_count'].sum():,}")
-    col4.metric("总收藏", f"{filtered_df['collected_count'].sum():,}")
+# ============================================================
+# Tab 1: 热帖排行
+# ============================================================
+with tab_hot:
+    if hot_all is None or hot_all.empty:
+        st.warning("暂无热帖数据")
+    else:
+        post_type = st.selectbox(
+            "帖子类型", ["全部", "图文 (normal)", "视频 (video)"],
+        )
+        if post_type == "全部":
+            df_hot = st.session_state.hot_all
+        elif post_type == "视频 (video)":
+            df_hot = st.session_state.hot_video
+        else:
+            df_hot = st.session_state.hot_normal
+
+        if df_hot.empty:
+            st.warning(f"该类型暂无帖子")
+            st.stop()
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("帖子总数", len(df_hot))
+        col2.metric("平均热度", f"{df_hot['hot_score'].mean():.2f}")
+        burst_count = (df_hot["score_burst"] > 0).sum()
+        col3.metric("有增量帖子", burst_count)
+        col4.metric("最高综合分", f"{df_hot['final_score'].max():.2f}")
+
+        st.divider()
+
+        view_mode = st.radio(
+            "榜单切换",
+            ["综合榜", "热门榜", "潜力榜"],
+            horizontal=True,
+        )
+
+        if view_mode == "综合榜":
+            sort_col = "final_score"
+        elif view_mode == "热门榜":
+            sort_col = "hot_score"
+        else:
+            sort_col = "score_burst"
+
+        display = df_hot.sort_values(sort_col, ascending=False).head(20)
+
+        col_left, col_right = st.columns([1.2, 1])
+
+        with col_left:
+            st.subheader("📋 排行榜")
+
+            table_data = display[
+                ["title", "nickname", "liked_count", "collected_count",
+                 "comment_count", "share_count", "hours_ago",
+                 "hot_score", "score_burst", "keyword_count", "final_score"]
+            ].copy()
+            table_data["hours_ago"] = table_data["hours_ago"].astype(int)
+
+            st.dataframe(
+                table_data,
+                column_config={
+                    "title": "标题",
+                    "nickname": "作者",
+                    "liked_count": "点赞",
+                    "collected_count": "收藏",
+                    "comment_count": "评论",
+                    "share_count": "分享",
+                    "hours_ago": "发帖(h)",
+                    "hot_score": st.column_config.NumberColumn("热门分", format="%.2f"),
+                    "score_burst": st.column_config.NumberColumn("潜力分", format="%.4f"),
+                    "keyword_count": "关键词数",
+                    "final_score": st.column_config.NumberColumn("综合分", format="%.2f"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=700,
+            )
+
+        with col_right:
+            st.subheader("热门 vs 潜力")
+
+            fig = px.scatter(
+                df_hot,
+                x="hot_score",
+                y="score_burst",
+                size="final_score",
+                hover_data=["title", "nickname"],
+                color="final_score",
+                color_continuous_scale="RdYlGn",
+                title="热门分 × 潜力分",
+            )
+            fig.add_hline(y=0.001, line_dash="dot", line_color="gray")
+            fig.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+            fig2 = px.scatter(
+                df_hot,
+                x="hours_ago",
+                y="final_score",
+                size="score_base" if "score_base" in df_hot.columns else "hot_score",
+                hover_data=["title", "nickname"],
+                color="score_burst",
+                color_continuous_scale="Blues",
+                title="时间衰减趋势",
+            )
+            fig2.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig2, use_container_width=True)
+
+
+# ============================================================
+# Tab 2: 发布时间优化
+# ============================================================
+with tab_time:
+    st.subheader("📅 时段 × 周几 热度矩阵")
+
+    df_t = df.copy()
+    df_t["hour"] = df_t["publish_hour"]
+    df_t["weekday"] = df_t["publish_weekday"]
+
+    weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+    # Compute average engagement per hour-weekday cell
+    df_t["engagement"] = (
+        df_t["liked_count"] + df_t["collected_count"] + df_t["comment_count"] + df_t["share_count"]
+    )
+
+    heat_data = df_t.groupby(["weekday", "hour"])["engagement"].agg(["mean", "count"]).reset_index()
+    heat_data["log_mean"] = np.log1p(heat_data["mean"])
+
+    pivot_mean = heat_data.pivot(index="weekday", columns="hour", values="log_mean").fillna(0)
+    pivot_count = heat_data.pivot(index="weekday", columns="hour", values="count").fillna(0)
+
+    # Ensure all weekdays and hours present
+    for d in range(7):
+        if d not in pivot_mean.index:
+            pivot_mean.loc[d] = 0
+            pivot_count.loc[d] = 0
+    pivot_mean = pivot_mean.sort_index()
+    pivot_count = pivot_count.sort_index()
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=pivot_mean.values,
+                x=[f"{h:02d}:00" for h in range(24)],
+                y=weekday_cn,
+                colorscale="YlOrRd",
+                text=np.round(pivot_mean.values, 1),
+                texttemplate="%{text}",
+                hovertemplate="%{y} %{x}<br>log(互动均值): %{z:.1f}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            title="互动热度矩阵 (log 均值)",
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=pivot_count.values,
+                x=[f"{h:02d}:00" for h in range(24)],
+                y=weekday_cn,
+                colorscale="Blues",
+                text=pivot_count.values.astype(int),
+                texttemplate="%{text}",
+                hovertemplate="%{y} %{x}<br>帖子数: %{z}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            title="发帖数量矩阵",
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
-    # Top N 选择
-    top_n = st.slider("显示 Top", 5, 50, 15, key="top_n_overview")
+    # Top vs Bottom comparison
+    st.subheader("Top 30% 热门帖 vs 全部帖子 — 发布时间分布")
 
-    col_left, col_right = st.columns(2)
+    col_a, col_b = st.columns(2)
 
-    with col_left:
-        metric = st.selectbox("排序指标", ["liked_count", "comment_count", "collected_count", "share_count"],
-                              format_func=lambda x: {"liked_count": "点赞", "comment_count": "评论", "collected_count": "收藏", "share_count": "分享"}[x])
+    with col_a:
+        threshold = df_t["engagement"].quantile(0.7)
+        hot_posts = df_t[df_t["engagement"] >= threshold]
 
-        top_data = filtered_df.nlargest(top_n, metric)[["title", metric, "nickname"]].copy()
-        top_data["short_title"] = top_data["title"].str[:25] + "..."
-        top_data = top_data.iloc[::-1]
+        all_hours = df_t["hour"].value_counts().reindex(range(24), fill_value=0)
+        hot_hours = hot_posts["hour"].value_counts().reindex(range(24), fill_value=0)
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            y=[f"{t}<br><sup>{n}</sup>" for t, n in zip(top_data["short_title"], top_data["nickname"])],
-            x=top_data[metric],
+            x=list(range(24)), y=all_hours.values,
+            name="全部帖子", marker_color="#b0c4de", opacity=0.7,
+        ))
+        fig.add_trace(go.Bar(
+            x=list(range(24)), y=hot_hours.values,
+            name="热门帖 (Top 30%)", marker_color="#ff6b6b",
+        ))
+        fig.update_layout(
+            title="发帖时段分布对比",
+            xaxis=dict(title="小时", tickmode="linear", dtick=2),
+            yaxis=dict(title="帖子数"),
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=20),
+            barmode="overlay",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        all_weekday = df_t["weekday"].value_counts().reindex(range(7), fill_value=0)
+        hot_weekday = hot_posts["weekday"].value_counts().reindex(range(7), fill_value=0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=weekday_cn, y=all_weekday.values,
+            name="全部帖子", marker_color="#b0c4de", opacity=0.7,
+        ))
+        fig.add_trace(go.Bar(
+            x=weekday_cn, y=hot_weekday.values,
+            name="热门帖 (Top 30%)", marker_color="#ff6b6b",
+        ))
+        fig.update_layout(
+            title="发帖星期分布对比",
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=20),
+            barmode="overlay",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Best time recommendation
+    st.divider()
+    st.subheader("💡 最佳发布时间建议")
+
+    best_cells = heat_data.nlargest(5, "mean")
+    recs = []
+    for _, row in best_cells.iterrows():
+        d = weekday_cn[int(row["weekday"])]
+        h = int(row["hour"])
+        n = int(row["count"])
+        avg_eng = int(row["mean"])
+        recs.append(f"**{d} {h:02d}:00~{h+1:02d}:00** — 平均互动 `{avg_eng:,}`，帖子数 `{n}`")
+
+    for r in recs:
+        st.markdown(f"- {r}")
+
+    overall_avg = df_t["engagement"].mean()
+    best_avg = best_cells["mean"].iloc[0]
+    st.caption(
+        f"最佳时段互动均值是最低时段的 **{best_avg / heat_data['mean'].min():.1f} 倍**，"
+        f"整体平均的 **{best_avg / overall_avg:.1f} 倍**"
+    )
+
+
+# ============================================================
+# Tab 3: 内容策略分析 (TF-IDF)
+# ============================================================
+with tab_content:
+    st.subheader("📝 关键词热度分析")
+
+    # Load stopwords from file
+    import os as _os
+    _sw_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "data", "stopwords.txt")
+    _sw_list = []
+    if _os.path.exists(_sw_path):
+        with open(_sw_path, "r", encoding="utf-8") as _f:
+            _sw_list = [line.strip() for line in _f if line.strip()]
+    STOPS = set(_sw_list)
+
+    if st.button("🔄 刷新 TF-IDF 分析"):
+        st.cache_data.clear()
+
+    @st.cache_data(ttl=86400)
+    def compute_tfidf(_df):
+        """title×3 + desc weighted TF-IDF, split by engagement groups."""
+        df_w = _df.copy()
+        df_w["engagement"] = (
+            df_w["liked_count"] + df_w["collected_count"] * 2
+            + df_w["comment_count"] * 3 + df_w["share_count"] * 4
+        )
+
+        # Combined text: title weighted ×3
+        df_w["full_text"] = (
+            (df_w["title"].fillna("") + " ") * 3 + df_w["desc"].fillna("")
+        )
+
+        # Tokenize
+        all_docs = []
+        for t in df_w["full_text"]:
+            words = [w.strip() for w in jieba.cut(t) if len(w.strip()) >= 2 and w.strip() not in STOPS]
+            all_docs.append(" ".join(words))
+
+        # TF-IDF
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vectorizer = TfidfVectorizer(max_features=200, ngram_range=(1, 2))
+        tfidf_matrix = vectorizer.fit_transform(all_docs)
+        feature_names = vectorizer.get_feature_names_out()
+
+        # Hot vs Cold group comparison
+        top_thresh = df_w["engagement"].quantile(0.7)
+        bot_thresh = df_w["engagement"].quantile(0.3)
+
+        hot_mask = df_w["engagement"] >= top_thresh
+        cold_mask = df_w["engagement"] <= bot_thresh
+
+        hot_tfidf = np.array(tfidf_matrix[hot_mask.to_numpy()].mean(axis=0)).flatten()
+        cold_tfidf = np.array(tfidf_matrix[cold_mask.to_numpy()].mean(axis=0)).flatten()
+        all_tfidf = np.array(tfidf_matrix.mean(axis=0)).flatten()
+
+        results = []
+        for i, name in enumerate(feature_names):
+            if hot_tfidf[i] > 0 or cold_tfidf[i] > 0:
+                ratio = hot_tfidf[i] / max(cold_tfidf[i], 0.0001)
+                results.append({
+                    "keyword": name,
+                    "hot_tfidf": round(hot_tfidf[i], 4),
+                    "cold_tfidf": round(cold_tfidf[i], 4),
+                    "all_tfidf": round(all_tfidf[i], 4),
+                    "ratio": round(ratio, 2),
+                })
+
+        kw_df = pd.DataFrame(results)
+        kw_df = kw_df.sort_values("hot_tfidf", ascending=False)
+        return kw_df, len(df_w[hot_mask]), len(df_w[cold_mask])
+
+    df_content = df.copy()
+    kw_df, hot_n, cold_n = compute_tfidf(df_content)
+
+    st.caption(f"热门组 (Top 30%): {hot_n} 篇 | 普通组 (Bottom 30%): {cold_n} 篇")
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.subheader("🔥 热门帖高频词")
+        top_hot = kw_df.nlargest(20, "hot_tfidf")
+
+        fig = px.bar(
+            top_hot.iloc[::-1],
+            x="hot_tfidf",
+            y="keyword",
             orientation="h",
-            marker_color=top_data[metric],
-            marker_colorscale="plasma",
-            text=top_data[metric],
+            title="热门帖 TF-IDF Top 20",
+            color="hot_tfidf",
+            color_continuous_scale="Reds",
+        )
+        fig.update_layout(height=550, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        st.subheader("📊 热度区分度 (Ratio)")
+        top_ratio = kw_df.nlargest(20, "ratio")
+
+        fig = px.bar(
+            top_ratio.iloc[::-1],
+            x="ratio",
+            y="keyword",
+            orientation="h",
+            title="热门帖 / 普通帖 TF-IDF 比值",
+            color="ratio",
+            color_continuous_scale="RdYlGn",
+        )
+        fig.add_vline(x=1, line_dash="dot", line_color="gray")
+        fig.update_layout(height=550, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- 句式分析 ----
+    st.subheader("❓ 句式分析：陈述 vs 疑问")
+
+    Q_MARKERS = re.compile(r"[？?]|[吗呢吧啊]$|什么|怎么|为什么|哪|谁|如何|有没有|是不是|能不能|可不可以|咋|啥")
+
+    df_q = df_content.copy()
+    df_q["is_question"] = df_q["title"].fillna("").apply(
+        lambda t: bool(Q_MARKERS.search(str(t)))
+    )
+    q_count = df_q["is_question"].sum()
+    s_count = (~df_q["is_question"]).sum()
+
+    df_q["engagement"] = (
+        df_q["liked_count"] + df_q["collected_count"] * 2
+        + df_q["comment_count"] * 3 + df_q["share_count"] * 4
+    )
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.metric("疑问句帖数", q_count)
+    with col_b:
+        st.metric("陈述句帖数", s_count)
+    with col_c:
+        ratio_str = f"{q_count / max(s_count, 1):.1%}"
+        st.metric("疑问占比", ratio_str)
+
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        # Average engagement by sentence type
+        q_avg = df_q[df_q["is_question"]]["engagement"].mean()
+        s_avg = df_q[~df_q["is_question"]]["engagement"].mean()
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=["陈述句", "疑问句"],
+            y=[s_avg, q_avg],
+            marker_color=["#b0c4de", "#ff6b6b"],
+            text=[f"{s_avg:,.0f}", f"{q_avg:,.0f}"],
             textposition="outside",
         ))
-        fig.update_layout(height=600, margin=dict(l=20, r=40, t=20, b=20), showlegend=False)
-        metric_cn = {"liked_count": "点赞", "comment_count": "评论", "collected_count": "收藏", "share_count": "分享"}[metric]
-        fig.update_xaxes(title=metric_cn)
+        fig.update_layout(
+            title="平均互动量对比",
+            height=400,
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-    with col_right:
-        # 互动量分布直方图
-        fig = px.histogram(filtered_df, x=metric, nbins=20, title=f"{metric_cn}分布",
-                           color_discrete_sequence=["#636efa"])
-        fig.update_layout(height=600)
+    with col_r:
+        # Hot vs Cold group: question ratio
+        top_thresh = df_q["engagement"].quantile(0.7)
+        bot_thresh = df_q["engagement"].quantile(0.3)
+
+        hot_q_ratio = df_q[df_q["engagement"] >= top_thresh]["is_question"].mean()
+        cold_q_ratio = df_q[df_q["engagement"] <= bot_thresh]["is_question"].mean()
+        all_q_ratio = df_q["is_question"].mean()
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=["热门组", "全部", "普通组"],
+            y=[hot_q_ratio * 100, all_q_ratio * 100, cold_q_ratio * 100],
+            marker_color=["#ff6b6b", "#fdcb6e", "#b0c4de"],
+            text=[f"{hot_q_ratio:.1%}", f"{all_q_ratio:.1%}", f"{cold_q_ratio:.1%}"],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            title="疑问句占比 (热门 vs 普通)",
+            yaxis=dict(title="疑问句占比 (%)"),
+            height=400,
+            margin=dict(l=20, r=20, t=40, b=20),
+        )
         st.plotly_chart(fig, use_container_width=True)
+
+    if hot_q_ratio > cold_q_ratio * 1.3:
+        st.success(f"疑问句在热门组占比 **{hot_q_ratio:.1%}**，高出普通组 **{cold_q_ratio:.1%}** 的 **{hot_q_ratio / max(cold_q_ratio, 0.01):.1f}** 倍 —— 疑问式标题可能更有吸引力")
+    elif cold_q_ratio > hot_q_ratio * 1.3:
+        st.info(f"陈述句在普通组占比更高，疑问句在热门组反而少，数据不支持疑问式标题优势")
+    else:
+        st.info("疑问句和陈述句在热度上无明显差异")
 
     st.divider()
 
-    # 数据表
-    with st.expander("📄 原始数据"):
-        cols_show = ["title", "nickname", "liked_count", "comment_count", "collected_count",
-                     "share_count", "publish_time", "ip_location", "type"]
-        st.dataframe(filtered_df[cols_show].sort_values("liked_count", ascending=False),
-                     use_container_width=True, hide_index=True)
+    st.subheader("💡 关键词建议")
+    ratio_words = kw_df[kw_df["ratio"] > 1.5].nlargest(10, "hot_tfidf")
+    if not ratio_words.empty:
+        st.markdown("**与高热度相关的关键词：**")
+        for _, r in ratio_words.iterrows():
+            st.markdown(
+                f"- **{r['keyword']}** — 热门 TF-IDF `{r['hot_tfidf']:.4f}` "
+                f"(×{r['ratio']:.1f} vs 普通帖)"
+            )
+    else:
+        st.info("暂无显著区分词，数据积累后会更明显")
 
-# ==================== Tab 2: 词云分析 ====================
-with tab2:
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        max_words = st.slider("最大词数", 20, 300, 150)
-    with col2:
-        min_word_len = st.slider("最小词长", 1, 4, 2)
-    with col3:
-        colormap_choice = st.selectbox("配色方案", ["plasma", "viridis", "magma", "inferno", "coolwarm", "Spectral"])
-    with col4:
-        wc_width = st.slider("词云宽度", 400, 1600, 1000, step=50)
+    with st.expander("📄 完整关键词表"):
+        st.dataframe(kw_df, use_container_width=True, hide_index=True)
 
-    # 停用词
-    default_stopwords = "的 了 在 是 我 有 和 就 不 人 都 一 这 他 她 它 们 那 些 做 什么 怎么 如果 因为 所以 但是 可以 觉得 感觉 这个 那个 真的 还是 然后 已经 非常 就是 好像 应该 一点 一下 有点 大家 或者 还有 不是 不过 确实 其实 很多 可能 需要 想 让 被 把 能 对 从 没 吗 吧 呢 啊 呀 哦 嗯 么 也 还 太 挺 更 最 又 再 才 刚 哈 啦 哟 嘛 哇 嘻 嘿 呵 小红书 车贴 贴 车 话题 like the to and a of in is it for http https com www video image note notes xhs xiaohongshu"
-    stopwords_input = st.text_area("停用词 (空格分隔)", default_stopwords, height=80)
 
-    stopwords = set(stopwords_input.split())
-
-    # 选择文本来源
-    text_source = st.multiselect("文本来源", ["title", "desc"], default=["title", "desc"])
-
-    if st.button("🔄 生成词云"):
-        combined_text = ""
-        for src in text_source:
-            combined_text += " ".join(filtered_df[src].fillna("").astype(str)) + " "
-
-        words = jieba.cut(combined_text)
-        filtered_words = []
-        for w in words:
-            w = w.strip()
-            if len(w) >= min_word_len and w not in stopwords and not w.isdigit():
-                filtered_words.append(w)
-
-        counter = Counter(filtered_words)
-
-        col_chart, col_freq = st.columns([1.5, 1])
-
-        with col_chart:
-            wc = WordCloud(
-                width=wc_width,
-                height=int(wc_width * 0.6),
-                background_color="white",
-                font_path=_get_font_path(),
-                max_words=max_words,
-                collocations=False,
-                colormap=colormap_choice,
-            ).generate_from_frequencies(counter)
-
-            fig, ax = __import__("matplotlib.pyplot", fromlist=["subplots"]).subplots(figsize=(wc_width/100, wc_width*0.6/100))
-            ax.imshow(wc, interpolation="bilinear")
-            ax.axis("off")
-            st.pyplot(fig)
-
-        with col_freq:
-            top_words = counter.most_common(50)
-            word_df = pd.DataFrame(top_words, columns=["词", "次数"])
-            fig = px.bar(word_df.head(20).iloc[::-1], x="次数", y="词", orientation="h",
-                         title="Top 20 高频词", color="次数", color_continuous_scale=colormap_choice)
-            fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
-
-# ==================== Tab 3: 时间分析 ====================
-with tab3:
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if time_granularity == "小时":
-            time_dist = filtered_df["publish_hour"].value_counts().sort_index()
-            fig = px.bar(x=time_dist.index, y=time_dist.values, title="发帖时段分布",
-                         labels={"x": "小时", "y": "帖子数"}, color_discrete_sequence=["#ff6b6b"])
-            fig.update_xaxes(tickmode="linear", dtick=1)
-            st.plotly_chart(fig, use_container_width=True)
-
-        elif time_granularity == "星期":
-            weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-            time_dist = filtered_df["publish_weekday"].value_counts().reindex(weekday_order).fillna(0)
-            fig = px.bar(x=weekday_cn, y=time_dist.values, title="发帖星期分布",
-                         labels={"x": "星期", "y": "帖子数"}, color_discrete_sequence=["#4ecdc4"])
-            st.plotly_chart(fig, use_container_width=True)
-
-        else:
-            time_dist = filtered_df["publish_date"].value_counts().sort_index()
-            fig = px.line(x=time_dist.index, y=time_dist.values, title="每日发帖趋势",
-                          markers=True, labels={"x": "日期", "y": "帖子数"})
-            fig.update_traces(line_color="#6c5ce7")
-            st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        # 时间范围统计
-        if "publish_time" in filtered_df.columns:
-            st.subheader("时间统计")
-            t_min = filtered_df["publish_time"].min()
-            t_max = filtered_df["publish_time"].max()
-            st.metric("最早帖子", t_min.strftime("%Y-%m-%d %H:%M"))
-            st.metric("最新帖子", t_max.strftime("%Y-%m-%d %H:%M"))
-            st.metric("时间跨度", f"{(t_max - t_min).days} 天")
-
-            # 更新延迟分析
-            filtered_df_copy = filtered_df.copy()
-            filtered_df_copy["update_delta_hours"] = (filtered_df_copy["update_time"] - filtered_df_copy["publish_time"]).dt.total_seconds() / 3600
-
-            delta_bins = [0, 1, 6, 24, 72, 168, float("inf")]
-            delta_labels = ["<1h", "1-6h", "6-24h", "1-3d", "3-7d", ">7d"]
-            filtered_df_copy["delta_group"] = pd.cut(filtered_df_copy["update_delta_hours"], bins=delta_bins, labels=delta_labels)
-            delta_dist = filtered_df_copy["delta_group"].value_counts().reindex(delta_labels).fillna(0)
-
-            fig = px.bar(x=delta_labels, y=delta_dist.values, title="发布到更新间隔",
-                         labels={"x": "时间差", "y": "帖子数"}, color_discrete_sequence=["#fdcb6e"])
-            st.plotly_chart(fig, use_container_width=True)
-
-    # 热度时间趋势
-    st.divider()
-    st.subheader("互动量与发布时间关系")
-    metric_choice = st.selectbox("选择指标", ["liked_count", "comment_count", "collected_count", "share_count"],
-                                 format_func=lambda x: {"liked_count": "点赞", "comment_count": "评论", "collected_count": "收藏", "share_count": "分享"}[x],
-                                 key="time_metric")
-
-    filtered_sorted = filtered_df.sort_values("publish_time")
-    fig = px.scatter(filtered_sorted, x="publish_time", y=metric_choice,
-                     size="liked_count", hover_data=["title", "nickname"],
-                     color=metric_choice, color_continuous_scale="plasma",
-                     title=f"发布时间 vs {metric_choice}")
-    st.plotly_chart(fig, use_container_width=True)
-
-# ==================== Tab 4: 评论分析 ====================
-with tab4:
+# ============================================================
+# Tab 4: 评论分析
+# ============================================================
+with tab_comments:
     if comments is not None and len(comments) > 0:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("评论总数", len(comments))
@@ -353,7 +614,9 @@ with tab4:
         with col_left:
             top_n_comments = st.slider("显示热门评论 Top", 5, 50, 20)
 
-            top_c = comments.nlargest(top_n_comments, "like_count")[["content", "like_count", "nickname"]].copy()
+            top_c = comments.nlargest(top_n_comments, "like_count")[
+                ["content", "like_count", "nickname"]
+            ].copy()
             top_c["short"] = top_c["content"].str[:30] + "..."
             top_c = top_c.iloc[::-1]
 
@@ -372,23 +635,25 @@ with tab4:
             st.plotly_chart(fig, use_container_width=True)
 
         with col_right:
-            # 评论 IP 分布
             ip_dist = comments["ip_location"].value_counts().head(15)
             fig = px.pie(values=ip_dist.values, names=ip_dist.index, title="评论 IP 属地分布")
             st.plotly_chart(fig, use_container_width=True)
 
-        # 评论时间趋势
         st.divider()
         if "create_time_dt" in comments.columns:
             comments_copy = comments.copy()
             comments_copy["comment_date"] = comments_copy["create_time_dt"].dt.date
             daily_comments = comments_copy["comment_date"].value_counts().sort_index()
-            fig = px.bar(x=daily_comments.index, y=daily_comments.values,
-                         title="每日评论数趋势", labels={"x": "日期", "y": "评论数"})
+            fig = px.bar(
+                x=daily_comments.index, y=daily_comments.values,
+                title="每日评论数趋势", labels={"x": "日期", "y": "评论数"},
+            )
             st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("📄 评论原始数据"):
-            st.dataframe(comments.sort_values("like_count", ascending=False),
-                         use_container_width=True, hide_index=True)
+            st.dataframe(
+                comments.sort_values("like_count", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
     else:
-        st.warning("未加载评论数据，请上传 search_comments CSV")
+        st.warning("未加载评论数据")

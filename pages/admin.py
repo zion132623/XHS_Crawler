@@ -56,7 +56,7 @@ with tab1:
     if "db_stats" in st.session_state:
         s = st.session_state.db_stats
         col1, col2 = st.columns(2)
-        col1.metric("帖子总数", s["contents"])
+        col1.metric("帖子总数", s["xhs_note"])
         col2.metric("评论总数", s["comments"])
 
     st.divider()
@@ -66,12 +66,12 @@ with tab1:
     with col1:
         if st.button("清空全部帖子", type="secondary"):
             try:
-                data = client.table("contents").select("note_id").execute()
+                data = client.table("xhs_note").select("note_id").execute()
                 ids = [r["note_id"] for r in (data.data or [])]
                 if ids:
                     for i in range(0, len(ids), 100):
                         chunk = ids[i:i + 100]
-                        client.table("contents").delete().in_("note_id", chunk).execute()
+                        client.table("xhs_note").delete().in_("note_id", chunk).execute()
                 st.success(f"已删除 {len(ids)} 条帖子")
                 st.session_state.db_stats = db.table_stats(client)
             except Exception as e:
@@ -91,20 +91,49 @@ with tab1:
                 st.error(f"删除失败: {e}")
 
 with tab2:
-    st.subheader("用户角色管理")
-    user_id = st.text_input("用户 UUID", placeholder="从 Supabase Auth → Users 复制 UUID")
-    role = st.selectbox("角色", ["viewer", "admin"])
-    if st.button("设置角色"):
-        if user_id:
-            try:
-                client.table("user_roles").upsert({"user_id": user_id, "role": role}).execute()
-                st.success(f"已设置 {user_id} 为 {role}")
-            except Exception as e:
-                st.error(f"设置失败: {e}")
-        else:
-            st.error("请输入用户 UUID")
+    st.subheader("用户管理")
 
-    st.info("用户 UUID 在 Supabase Dashboard → Authentication → Users 查看")
+    sub_a, sub_b = st.columns(2)
+
+    with sub_a:
+        st.caption("创建新用户（自动设角色）")
+        new_email = st.text_input("邮箱", key="new_user_email")
+        new_pw = st.text_input("密码", type="password", key="new_user_pw")
+        new_role = st.selectbox("角色", ["viewer", "admin"], key="new_user_role")
+        if st.button("创建用户", use_container_width=True):
+            if new_email and new_pw:
+                try:
+                    res = client.auth.sign_up(
+                        {"email": new_email, "password": new_pw}
+                    )
+                    if res.user:
+                        uid = res.user.id
+                        client.table("user_roles").upsert(
+                            {"user_id": uid, "role": new_role}
+                        ).execute()
+                        st.success(f"用户 {new_email} 已创建，角色: {new_role}")
+                    else:
+                        st.success(f"用户 {new_email} 已创建（需确认邮箱后首次登录）")
+                except Exception as e:
+                    st.error(f"创建失败: {e}")
+            else:
+                st.error("请输入邮箱和密码")
+
+    with sub_b:
+        st.caption("已有用户改角色")
+        user_id = st.text_input("用户 UUID", placeholder="粘贴 UUID")
+        role = st.selectbox("角色", ["viewer", "admin"], key="set_role")
+        if st.button("设置角色", use_container_width=True):
+            if user_id:
+                try:
+                    client.table("user_roles").upsert({"user_id": user_id, "role": role}).execute()
+                    st.success(f"已设置 {user_id} 为 {role}")
+                except Exception as e:
+                    st.error(f"设置失败: {e}")
+            else:
+                st.error("请输入用户 UUID")
+
+        st.info("UUID 从 Supabase Dashboard → Authentication → Users 查看")
 
 with tab3:
     st.subheader("导入 CSV 到 Supabase")
