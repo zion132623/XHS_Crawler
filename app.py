@@ -103,8 +103,9 @@ with st.sidebar:
                 ["liked_count", "collected_count", "comment_count", "share_count"],
             )
             comments_data = db.query_comments(client)
-            comments_data = clean_numeric_cols(comments_data, ["like_count", "sub_comment_count"])
-            comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
+            if not comments_data.empty and "create_time" in comments_data.columns:
+                comments_data = clean_numeric_cols(comments_data, ["like_count", "sub_comment_count"])
+                comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
             st.session_state.comments = comments_data
             st.session_state.hot_all = db.query_hot_posts(client)
             st.session_state.hot_normal = db.query_hot_posts(client, post_type="normal")
