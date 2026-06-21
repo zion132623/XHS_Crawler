@@ -400,13 +400,22 @@ with tab_time:
 with tab_content:
     st.subheader("📝 关键词热度分析")
 
-    # Load stopwords from file
-    import os as _os
-    _sw_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "data", "stopwords.txt")
+    # Load stopwords from Supabase
     _sw_list = []
-    if _os.path.exists(_sw_path):
-        with open(_sw_path, "r", encoding="utf-8") as _f:
-            _sw_list = [line.strip() for line in _f if line.strip()]
+    try:
+        _sw_client = db.connect()
+        if _sw_client:
+            _start, _limit = 0, 1000
+            while True:
+                _res = _sw_client.table("stopwords").select("word").range(_start, _start + _limit - 1).execute()
+                if not _res.data:
+                    break
+                _sw_list.extend(r["word"] for r in _res.data)
+                if len(_res.data) < _limit:
+                    break
+                _start += _limit
+    except Exception:
+        pass
     STOPS = set(_sw_list)
 
     if st.button("🔄 刷新 TF-IDF 分析"):
