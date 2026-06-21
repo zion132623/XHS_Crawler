@@ -7,9 +7,17 @@ from collections import Counter
 import jieba
 import math
 import re
+import os
 from datetime import datetime
-from dotenv import load_dotenv
-load_dotenv()
+
+# Try st.secrets first (Streamlit Cloud), fall back to .env (local)
+try:
+    os.environ["SUPABASE_URL"] = st.secrets["SUPABASE_URL"]
+    os.environ["SUPABASE_ANON_KEY"] = st.secrets["SUPABASE_ANON_KEY"]
+except Exception:
+    from dotenv import load_dotenv
+    load_dotenv()
+
 import db
 import auth
 
