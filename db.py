@@ -446,3 +446,43 @@ def query_hot_posts(
 
     result = result.sort_values("final_score", ascending=False).head(limit)
     return result
+
+
+def query_creators(client: Client) -> pd.DataFrame:
+    """Fetch all xhs_creator records from Supabase."""
+    if not client:
+        return pd.DataFrame()
+    data = []
+    start, limit = 0, 1000
+    while True:
+        res = client.table("xhs_creator").select("*").range(start, start + limit - 1).execute()
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < limit:
+            break
+        start += limit
+    return pd.DataFrame(data)
+
+
+def parse_tags(tag_list_raw):
+    """
+    Parse tag_list from xhs_creator into a dict.
+    Handles both double-encoded JSON (legacy) and normal JSON.
+    Returns {"tagType": "name", ...} or empty dict on failure.
+    """
+    import json
+    if not tag_list_raw or not isinstance(tag_list_raw, str):
+        return {}
+    s = tag_list_raw.strip()
+    if not s:
+        return {}
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            return json.loads(parsed)
+        return {}
+    except (json.JSONDecodeError, TypeError):
+        return {}

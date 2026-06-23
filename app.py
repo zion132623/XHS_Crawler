@@ -110,10 +110,12 @@ with st.sidebar:
             st.session_state.hot_all = db.query_hot_posts(client)
             st.session_state.hot_normal = db.query_hot_posts(client, post_type="normal")
             st.session_state.hot_video = db.query_hot_posts(client, post_type="video")
+            st.session_state.creators = db.query_creators(client)
 
     st.info(
         f"📊 帖子 {st.session_state.db_stats.get('xhs_note', 0)} 条 "
-        f"| 评论 {st.session_state.db_stats['comments']} 条"
+        f"| 评论 {st.session_state.db_stats['comments']} 条 "
+        f"| 创作者 {len(st.session_state.creators)} 位"
     )
 
     st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
@@ -131,10 +133,11 @@ with st.sidebar:
 df = st.session_state.xhs_note
 comments = st.session_state.comments if "comments" in st.session_state else None
 hot_all = st.session_state.get("hot_all")
+creators = st.session_state.get("creators", pd.DataFrame())
 
 # ==================== Tab 页 ====================
-tab_hot, tab_time, tab_content, tab_comments = st.tabs(
-    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "💬 评论分析"]
+tab_hot, tab_time, tab_content, tab_comments, tab_peers = st.tabs(
+    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "💬 评论分析", "🔍 同行分析"]
 )
 
 # ============================================================
@@ -599,6 +602,60 @@ with tab_content:
 
     st.divider()
 
+    # ---- 帖子格式分析 ----
+    st.subheader("📐 帖子格式分析：图片数 / 标题字数 / 描述字数")
+
+    df["image_count"] = df["image_list"].fillna("").apply(
+        lambda x: len([u for u in str(x).split(",") if u.strip()]) if x else 0
+    )
+    df["title_len"] = df["title"].fillna("").apply(len)
+    df["desc_len"] = df["desc"].fillna("").apply(len)
+    df["engagement"] = (
+        df["liked_count"] + df["collected_count"] * 2
+        + df["comment_count"] * 3 + df["share_count"] * 4
+    )
+    top_thresh = df["engagement"].quantile(0.7)
+    hot_mask = df["engagement"] >= top_thresh
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.markdown("**图片数量**")
+        all_imgs = df["image_count"].value_counts().reindex(range(0, 19), fill_value=0)
+        hot_imgs = df[hot_mask]["image_count"].value_counts().reindex(range(0, 19), fill_value=0)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=list(range(19)), y=all_imgs.values, name="全部", marker_color="#b0c4de", opacity=0.7))
+        fig.add_trace(go.Bar(x=list(range(19)), y=hot_imgs.values, name="热门 (Top 30%)", marker_color="#ff6b6b"))
+        fig.update_layout(title="图片数量分布", xaxis=dict(title="图片数", dtick=2), yaxis=dict(title="帖子数"), height=350, margin=dict(l=20, r=20, t=40, b=20), barmode="overlay")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        st.markdown("**标题字数**")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=df["title_len"], name="全部", marker_color="#b0c4de", opacity=0.7, nbinsx=20))
+        fig.add_trace(go.Histogram(x=df[hot_mask]["title_len"], name="热门 (Top 30%)", marker_color="#ff6b6b", nbinsx=20))
+        fig.update_layout(title="标题字数分布", xaxis=dict(title="字数"), yaxis=dict(title="帖子数"), height=350, margin=dict(l=20, r=20, t=40, b=20), barmode="overlay")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_c:
+        st.markdown("**描述字数**")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=df["desc_len"], name="全部", marker_color="#b0c4de", opacity=0.7, nbinsx=20))
+        fig.add_trace(go.Histogram(x=df[hot_mask]["desc_len"], name="热门 (Top 30%)", marker_color="#ff6b6b", nbinsx=20))
+        fig.update_layout(title="描述字数分布", xaxis=dict(title="字数"), yaxis=dict(title="帖子数"), height=350, margin=dict(l=20, r=20, t=40, b=20), barmode="overlay")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Summary stats
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("热门帖平均图片数", f"{df[hot_mask]['image_count'].mean():.1f} 张")
+    with col_b:
+        st.metric("热门帖平均标题字数", f"{df[hot_mask]['title_len'].mean():.0f} 字")
+    with col_c:
+        st.metric("热门帖平均描述字数", f"{df[hot_mask]['desc_len'].mean():.0f} 字")
+
+    st.divider()
+
     st.subheader("💡 关键词建议")
     ratio_words = kw_df[kw_df["ratio"] > 1.5].nlargest(10, "hot_tfidf")
     if not ratio_words.empty:
@@ -676,3 +733,499 @@ with tab_comments:
             )
     else:
         st.warning("未加载评论数据")
+
+
+# ============================================================
+# Tab 5: 同行分析
+# ============================================================
+MY_SHOP_USER_ID = "5d0cf92a0000000012020861"
+MY_SHOP_NAME = "wireless shop无线商店"
+
+with tab_peers:
+    if creators.empty:
+        st.warning("暂无创作者数据，请先爬取同行数据")
+        st.stop()
+
+    import json
+
+    # --- 数据预处理 ---
+    creators_df = creators.copy()
+    for col in ["fans", "follows", "interaction"]:
+        if col in creators_df.columns:
+            creators_df[col] = creators_df[col].apply(parse_wan)
+
+    # 统计每个创作者的帖子数
+    post_counts = df["user_id"].value_counts() if "user_id" in df.columns else pd.Series()
+    creators_df["post_count"] = creators_df["user_id"].map(post_counts).fillna(0).astype(int)
+
+    # ---- 从帖子 (xhs_note) 构建标签数据 ----
+    # xhs_note.tag_list 是逗号分隔的字符串: "tag1,tag2,tag3"
+    post_tag_rows = []
+    if "user_id" in df.columns and "tag_list" in df.columns:
+        for _, note in df.iterrows():
+            uid = note.get("user_id")
+            raw_tags = note.get("tag_list", "")
+            if not uid or pd.isna(raw_tags) or not str(raw_tags).strip():
+                continue
+            tags = [t.strip() for t in str(raw_tags).split(",") if t.strip()]
+            for tag in tags:
+                post_tag_rows.append({
+                    "user_id": uid,
+                    "tag_name": tag,
+                })
+
+    post_tags_df = pd.DataFrame(post_tag_rows)
+
+    # --- KPI 卡片 ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("创作者总数", len(creators_df))
+    total_posts = creators_df["post_count"].sum()
+    col2.metric("帖子总数", total_posts)
+    col3.metric("平均粉丝", f"{creators_df['fans'].mean():,.0f}")
+    col4.metric("平均互动", f"{creators_df['interaction'].mean():,.0f}")
+
+    st.divider()
+
+    # --- 创作者选择器 ---
+    creator_options = creators_df[["user_id", "nickname", "post_count"]].copy()
+    creator_options["label"] = creator_options.apply(
+        lambda r: f"{r['nickname']} (帖子:{r['post_count']}) [{r['user_id'][:12]}...]",
+        axis=1,
+    )
+    creator_options = creator_options.sort_values("post_count", ascending=False)
+
+    default_idx = 0
+    wireless_idx = creator_options[creator_options["user_id"] == MY_SHOP_USER_ID].index
+    if not wireless_idx.empty:
+        default_idx = creator_options.index.get_loc(wireless_idx[0])
+
+    selected_label = st.selectbox(
+        "🎯 选择要分析的创作者",
+        creator_options["label"].tolist(),
+        index=default_idx,
+        key="peer_selector",
+    )
+    selected_uid = creator_options[creator_options["label"] == selected_label]["user_id"].iloc[0]
+    selected_nickname = creator_options[creator_options["label"] == selected_label]["nickname"].iloc[0]
+    selected_row = creators_df[creators_df["user_id"] == selected_uid]
+    selected_me = selected_row.iloc[0] if not selected_row.empty else None
+
+    # ============================================================
+    # 📌 选中创作者帖子
+    # ============================================================
+    st.subheader(f"📌 {selected_nickname} 的帖子")
+
+    sel_notes = df[df["user_id"] == selected_uid].copy()
+    if not sel_notes.empty:
+        sel_notes["publish_dt"] = pd.to_datetime(sel_notes["time"], unit="ms")
+        sel_notes["engagement"] = (
+            sel_notes["liked_count"] + sel_notes["collected_count"] * 2
+            + sel_notes["comment_count"] * 3 + sel_notes["share_count"] * 4
+        )
+        sel_notes_display = sel_notes.sort_values("publish_dt", ascending=False)[
+            ["title", "publish_dt", "liked_count", "collected_count",
+             "comment_count", "share_count", "engagement", "note_url"]
+        ].copy()
+        sel_notes_display["publish_dt"] = sel_notes_display["publish_dt"].dt.strftime("%Y-%m-%d %H:%M")
+
+        st.dataframe(
+            sel_notes_display,
+            column_config={
+                "title": "标题",
+                "publish_dt": "发布时间",
+                "liked_count": "点赞",
+                "collected_count": "收藏",
+                "comment_count": "评论",
+                "share_count": "分享",
+                "engagement": st.column_config.NumberColumn("互动分", format="%.0f"),
+                "note_url": st.column_config.LinkColumn("链接"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=350,
+        )
+        st.caption(f"共 {len(sel_notes)} 条帖子")
+    else:
+        st.info("暂无我店铺的帖子数据")
+
+    st.divider()
+
+    # ============================================================
+    # Section 1: 帖子画像分析 (基于 xhs_note)
+    # ============================================================
+    st.subheader("📊 帖子画像分析")
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        # 各创作者帖子数量分布
+        top_posters = creators_df.nlargest(15, "post_count")[
+            ["nickname", "post_count"]
+        ].sort_values("post_count")
+        fig = px.bar(
+            x=top_posters["post_count"], y=top_posters["nickname"],
+            orientation="h",
+            title="创作者帖子数 Top 15",
+            labels={"x": "帖子数", "y": ""},
+            color=top_posters["post_count"],
+            color_continuous_scale="Blues",
+        )
+        fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        # 帖子类型分布 (normal vs video)
+        if "type" in df.columns:
+            type_counts = df["type"].value_counts()
+            type_labels = {"normal": "图文", "video": "视频"}
+            type_names = [type_labels.get(t, t) for t in type_counts.index]
+            fig = px.pie(
+                values=type_counts.values, names=type_names,
+                title="帖子类型分布",
+            )
+            fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("无帖子类型数据")
+
+    st.divider()
+
+    # 帖子标签频率 Top 25
+    if not post_tags_df.empty:
+        st.subheader("🏷️ 帖子标签热度 Top 25")
+        tag_freq = post_tags_df["tag_name"].value_counts().head(25)
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            fig = px.bar(
+                x=tag_freq.values, y=tag_freq.index,
+                orientation="h",
+                title="全部帖子标签 Top 25",
+                labels={"x": "出现次数", "y": "标签"},
+                color=tag_freq.values,
+                color_continuous_scale="Reds",
+            )
+            fig.update_layout(height=500, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_b:
+            # 我方标签 vs 同行标签
+            sel_tags_series = post_tags_df[post_tags_df["user_id"] == selected_uid]["tag_name"].value_counts().head(20)
+            others_tags_series = post_tags_df[post_tags_df["user_id"] != selected_uid]["tag_name"].value_counts()
+
+            # 按同行热度排序的选中创作者标签
+            sel_tags_ranked = sel_tags_series.index.tolist()
+            sel_tags_with_freq = [
+                (t, sel_tags_series.get(t, 0), others_tags_series.get(t, 0))
+                for t in sel_tags_ranked
+            ]
+            sel_tags_with_freq.sort(key=lambda x: x[2], reverse=True)
+            top_sel_tags = sel_tags_with_freq[:20]
+
+            tag_labels = [t[0] for t in top_sel_tags]
+            sel_vals = [t[1] for t in top_sel_tags]
+            others_vals = [t[2] for t in top_sel_tags]
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=tag_labels, x=others_vals,
+                orientation="h", name="同行使用次数",
+                marker_color="#b0c4de",
+            ))
+            fig.add_trace(go.Bar(
+                y=tag_labels, x=sel_vals,
+                orientation="h", name=f"{selected_nickname}使用次数",
+                marker_color="#ff6b6b",
+            ))
+            fig.update_layout(
+                title=f"{selected_nickname} 标签 vs 同行 (按同行热度排序)",
+                xaxis=dict(title="出现次数"),
+                height=500,
+                margin=dict(l=20, r=20, t=40, b=20),
+                barmode="overlay",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("帖子暂无标签数据")
+
+    st.divider()
+
+    # ============================================================
+    # Section 2: 帖子标签交叉分析 (基于帖子)
+    # ============================================================
+    st.subheader("🔗 帖子标签交叉分析")
+
+    if not post_tags_df.empty and post_tags_df["user_id"].nunique() >= 3:
+        # 为每个创作者构建标签列表（去重）
+        creator_tag_groups = post_tags_df.groupby("user_id").apply(
+            lambda g: list(g["tag_name"].unique())
+        )
+        creator_tag_groups = creator_tag_groups[creator_tag_groups.apply(len) >= 2]
+
+        if len(creator_tag_groups) >= 5:
+            cooccur = {}
+            tag_freq_all = {}
+            for tags in creator_tag_groups:
+                for t in tags:
+                    tag_freq_all[t] = tag_freq_all.get(t, 0) + 1
+                for i in range(len(tags)):
+                    for j in range(i + 1, len(tags)):
+                        a, b = sorted([tags[i], tags[j]])
+                        cooccur[(a, b)] = cooccur.get((a, b), 0) + 1
+
+            top_tags = sorted(tag_freq_all, key=tag_freq_all.get, reverse=True)[:15]
+            matrix = pd.DataFrame(0, index=top_tags, columns=top_tags)
+            for (a, b), cnt in cooccur.items():
+                if a in top_tags and b in top_tags:
+                    matrix.loc[a, b] = cnt
+                    matrix.loc[b, a] = cnt
+            for t in top_tags:
+                matrix.loc[t, t] = tag_freq_all[t]
+
+            col_a, col_b = st.columns([1.2, 1])
+
+            with col_a:
+                fig = go.Figure(
+                    data=go.Heatmap(
+                        z=matrix.values,
+                        x=top_tags,
+                        y=top_tags,
+                        colorscale="YlOrRd",
+                        text=matrix.values.astype(int),
+                        texttemplate="%{text}",
+                        hovertemplate="%{x} ↔ %{y}<br>共现: %{z}<extra></extra>",
+                    )
+                )
+                fig.update_layout(
+                    title="帖子标签共现矩阵 (Top 15)",
+                    height=550,
+                    margin=dict(l=20, r=20, t=40, b=80),
+                    xaxis=dict(tickangle=45),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_b:
+                top_pairs = sorted(cooccur.items(), key=lambda x: x[1], reverse=True)[:10]
+                pair_labels = [f"{a}\n↔\n{b}" for (a, b), _ in top_pairs]
+                pair_counts = [cnt for _, cnt in top_pairs]
+
+                fig = px.bar(
+                    x=pair_counts, y=pair_labels,
+                    orientation="h",
+                    title="Top 10 标签组合",
+                    labels={"x": "共现次数", "y": "标签对"},
+                    color=pair_counts,
+                    color_continuous_scale="Purples",
+                )
+                fig.update_layout(height=550, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("有 ≥2 个标签的创作者不足 5 位，无法进行共现分析")
+    else:
+        st.info("需要至少 3 位有帖子标签的创作者才能进行交叉分析")
+
+    st.divider()
+
+    # ============================================================
+    # Section 3: 选中创作者 vs 同行对比
+    # ============================================================
+    st.subheader("🆚 对比分析")
+
+    if selected_me is None:
+        st.warning(f"未找到创作者数据")
+    else:
+        others = creators_df[creators_df["user_id"] != selected_uid]
+
+        # Safe mean/median helpers — handle NaN when others is empty
+        _fm = lambda s, default=0: 0.0 if pd.isna(s.mean()) else s.mean()
+        _fmed = lambda s, default=0: 0.0 if pd.isna(s.median()) else s.median()
+
+        st.markdown(
+            f"**选中：** {selected_nickname} | "
+            f"帖子 **{int(selected_me['post_count'])}** 条 | "
+            f"**同行对比：** {len(others)} 位创作者"
+        )
+
+        col_a, col_b, col_c = st.columns(3)
+
+        with col_a:
+            st.metric(
+                "粉丝数",
+                f"{selected_me['fans']:,}",
+                delta=f"{selected_me['fans'] - _fm(others['fans']):+,.0f} vs 同行均值 ({_fm(others['fans']):,.0f})",
+            )
+        with col_b:
+            st.metric(
+                "互动数",
+                f"{selected_me['interaction']:,}",
+                delta=f"{selected_me['interaction'] - _fm(others['interaction']):+,.0f} vs 同行均值 ({_fm(others['interaction']):,.0f})",
+            )
+        with col_c:
+            st.metric(
+                "帖子数",
+                f"{int(selected_me['post_count'])}",
+                delta=f"{int(selected_me['post_count']) - int(_fm(others['post_count'])):+.0f} vs 同行均值 ({_fm(others['post_count']):.1f})",
+            )
+
+        st.divider()
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            metrics_data = pd.DataFrame({
+                "指标": ["粉丝", "互动", "关注", "帖子数"],
+                selected_nickname: [
+                    selected_me["fans"], selected_me["interaction"],
+                    selected_me["follows"], int(selected_me["post_count"]),
+                ],
+                "同行均值": [
+                    _fm(others["fans"]), _fm(others["interaction"]),
+                    _fm(others["follows"]), _fm(others["post_count"]),
+                ],
+                "同行中位数": [
+                    _fmed(others["fans"]), _fmed(others["interaction"]),
+                    _fmed(others["follows"]), _fmed(others["post_count"]),
+                ],
+            })
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=metrics_data["指标"], y=metrics_data["同行均值"],
+                name="同行均值", marker_color="#b0c4de",
+            ))
+            fig.add_trace(go.Bar(
+                x=metrics_data["指标"], y=metrics_data["同行中位数"],
+                name="同行中位数", marker_color="#95a5a6",
+            ))
+            fig.add_trace(go.Bar(
+                x=metrics_data["指标"], y=metrics_data[selected_nickname],
+                name=selected_nickname, marker_color="#ff6b6b",
+            ))
+            fig.update_layout(
+                title=f"多维度对比：{selected_nickname} vs 同行",
+                yaxis=dict(title="数量"),
+                height=400,
+                margin=dict(l=20, r=20, t=40, b=20),
+                barmode="group",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_b:
+            if not post_tags_df.empty:
+                sel_tag_freq = post_tags_df[post_tags_df["user_id"] == selected_uid]["tag_name"].value_counts()
+                others_tag_freq = post_tags_df[post_tags_df["user_id"] != selected_uid]["tag_name"].value_counts()
+
+                diff_data = []
+                for tag in sel_tag_freq.head(15).index:
+                    diff_data.append({
+                        "tag": tag,
+                        "sel_count": int(sel_tag_freq.get(tag, 0)),
+                        "others_count": int(others_tag_freq.get(tag, 0)),
+                    })
+                diff_df = pd.DataFrame(diff_data)
+
+                if not diff_df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        y=diff_df["tag"], x=diff_df["others_count"],
+                        orientation="h", name="同行使用次数",
+                        marker_color="#b0c4de",
+                    ))
+                    fig.add_trace(go.Bar(
+                        y=diff_df["tag"], x=diff_df["sel_count"],
+                        orientation="h", name=f"{selected_nickname}使用次数",
+                        marker_color="#ff6b6b",
+                    ))
+                    fig.update_layout(
+                        title=f"帖子标签对比：{selected_nickname} vs 同行",
+                        xaxis=dict(title="出现次数"),
+                        height=400,
+                        margin=dict(l=20, r=20, t=40, b=20),
+                        barmode="overlay",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("该创作者帖子暂无标签")
+            else:
+                st.info("无帖子标签数据")
+
+    st.divider()
+
+    # ============================================================
+    # 创作者详情表 (仅粉丝/关注/互动)
+    # ============================================================
+    with st.expander("📄 创作者详情表"):
+        display_cols = ["nickname", "user_id", "fans", "follows", "interaction", "post_count"]
+        display = creators_df[[c for c in display_cols if c in creators_df.columns]].copy()
+        st.dataframe(
+            display.sort_values("fans", ascending=False),
+            column_config={
+                "nickname": "昵称",
+                "user_id": "用户ID",
+                "fans": "粉丝",
+                "follows": "关注",
+                "interaction": "互动",
+                "post_count": "帖子数",
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+        )
+
+    st.divider()
+
+    # ============================================================
+    # 🔍 创作者帖子反查
+    # ============================================================
+    st.subheader("🔍 创作者帖子反查")
+
+    # 使用已加载的 creator_options，构建查询专用的下拉
+    lookup_options = creator_options.copy()
+    lookup_default_idx = 0
+    cur_idx = lookup_options[lookup_options["user_id"] == selected_uid].index
+    if not cur_idx.empty:
+        lookup_default_idx = lookup_options.index.get_loc(cur_idx[0])
+
+    lookup_label = st.selectbox(
+        "选择创作者查看帖子",
+        lookup_options["label"].tolist(),
+        index=lookup_default_idx,
+        key="peer_post_lookup",
+    )
+    lookup_uid = lookup_options[lookup_options["label"] == lookup_label]["user_id"].iloc[0]
+
+    lookup_notes = df[df["user_id"] == lookup_uid].copy()
+    if not lookup_notes.empty:
+        lookup_notes["publish_dt"] = pd.to_datetime(lookup_notes["time"], unit="ms")
+        lookup_notes["engagement"] = (
+            lookup_notes["liked_count"] + lookup_notes["collected_count"] * 2
+            + lookup_notes["comment_count"] * 3 + lookup_notes["share_count"] * 4
+        )
+        lookup_display = lookup_notes.sort_values("publish_dt", ascending=False)[
+            ["title", "publish_dt", "liked_count", "collected_count",
+             "comment_count", "share_count", "engagement", "note_url"]
+        ].copy()
+        lookup_display["publish_dt"] = lookup_display["publish_dt"].dt.strftime("%Y-%m-%d %H:%M")
+
+        lookup_name = lookup_notes["nickname"].iloc[0] if "nickname" in lookup_notes.columns else lookup_uid
+        st.caption(f"**{lookup_name}** — 共 {len(lookup_notes)} 条帖子")
+
+        st.dataframe(
+            lookup_display,
+            column_config={
+                "title": "标题",
+                "publish_dt": "发布时间",
+                "liked_count": "点赞",
+                "collected_count": "收藏",
+                "comment_count": "评论",
+                "share_count": "分享",
+                "engagement": st.column_config.NumberColumn("互动分", format="%.0f"),
+                "note_url": st.column_config.LinkColumn("链接"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+        )
+    else:
+        st.info("该创作者暂无帖子数据")
