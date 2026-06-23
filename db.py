@@ -432,7 +432,8 @@ def query_hot_posts(
     result_cols = [
         "note_id", "title", "nickname",
         "liked_count", "collected_count", "comment_count", "share_count",
-        "hours_ago", "score_base", "hot_score", "score_burst", "keyword_count", "final_score",
+        "hours_ago", "score_base", "hot_score", "score_burst",
+        "keyword_count", "source_keyword", "final_score",
     ]
     if "type" in df.columns:
         result_cols.insert(3, "type")
