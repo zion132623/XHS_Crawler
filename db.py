@@ -430,7 +430,7 @@ def query_hot_posts(
     df["final_score"] = df["hot_score"] * (1 + df["score_burst"]) * df["kw_multiplier"]
 
     result_cols = [
-        "note_id", "title", "nickname",
+        "note_id", "title", "nickname", "note_url",
         "liked_count", "collected_count", "comment_count", "share_count",
         "hours_ago", "score_base", "hot_score", "score_burst",
         "keyword_count", "source_keyword", "final_score",
@@ -447,6 +447,23 @@ def query_hot_posts(
 
     result = result.sort_values("final_score", ascending=False).head(limit)
     return result
+
+
+def query_xhs_note_comments(client: Client) -> pd.DataFrame:
+    """Fetch all xhs_note_comment records from Supabase."""
+    if not client:
+        return pd.DataFrame()
+    data = []
+    start, limit = 0, 1000
+    while True:
+        res = client.table("xhs_note_comment").select("*").range(start, start + limit - 1).execute()
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < limit:
+            break
+        start += limit
+    return pd.DataFrame(data)
 
 
 def query_creators(client: Client) -> pd.DataFrame:

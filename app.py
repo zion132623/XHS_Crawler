@@ -136,8 +136,8 @@ hot_all = st.session_state.get("hot_all")
 creators = st.session_state.get("creators", pd.DataFrame())
 
 # ==================== Tab 页 ====================
-tab_hot, tab_time, tab_content, tab_comments, tab_peers = st.tabs(
-    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "💬 评论分析", "🔍 同行分析"]
+tab_hot, tab_time, tab_content, tab_peers = st.tabs(
+    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "🔍 同行分析"]
 )
 
 # ============================================================
@@ -218,6 +218,30 @@ with tab_hot:
             )
         else:
             st.info("暂无多关键词帖子")
+
+        st.divider()
+
+        # 💬 热帖评论查看
+        st.subheader("💬 查看笔记评论")
+        note_opts_cols = [c for c in ["note_id", "title", "nickname", "comment_count", "note_url"] if c in df_hot.columns]
+        note_options = df_hot[note_opts_cols].copy()
+        note_options["label"] = note_options.apply(
+            lambda r: f"[{r['comment_count']}评] {r['title'][:50]} — @{r['nickname']} ({r['note_id'][:12]}...)",
+            axis=1,
+        )
+        note_options = note_options.sort_values("comment_count", ascending=False)
+        selected_note_label = st.selectbox(
+            "选择笔记查看评论",
+            note_options["label"].tolist(),
+            key="comment_view_selector",
+        )
+        if selected_note_label:
+            sel_row = note_options[note_options["label"] == selected_note_label].iloc[0]
+            if st.button("📥 查看评论", key="load_comments_btn", type="primary"):
+                st.session_state.view_note_id = sel_row["note_id"]
+                st.session_state.view_note_title = sel_row["title"]
+                st.session_state.view_note_url = sel_row["note_url"] if "note_url" in sel_row.index else ""
+                st.switch_page("pages/_comments.py")
 
         st.divider()
 
@@ -725,70 +749,7 @@ with tab_content:
 
 
 # ============================================================
-# Tab 4: 评论分析
-# ============================================================
-with tab_comments:
-    if comments is not None and len(comments) > 0:
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("评论总数", len(comments))
-        col2.metric("总点赞", f"{comments['like_count'].sum():,}")
-        col3.metric("涉及帖子", comments["note_id"].nunique())
-        col4.metric("评论用户", comments["user_id"].nunique())
-
-        st.divider()
-
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            top_n_comments = st.slider("显示热门评论 Top", 5, 50, 20)
-
-            top_c = comments.nlargest(top_n_comments, "like_count")[
-                ["content", "like_count", "nickname"]
-            ].copy()
-            top_c["short"] = top_c["content"].str[:30] + "..."
-            top_c = top_c.iloc[::-1]
-
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                y=[f"{s}<br><sup>{n}</sup>" for s, n in zip(top_c["short"], top_c["nickname"])],
-                x=top_c["like_count"],
-                orientation="h",
-                marker_color=top_c["like_count"],
-                marker_colorscale="viridis",
-                text=top_c["like_count"],
-                textposition="outside",
-            ))
-            fig.update_layout(height=700, margin=dict(l=20, r=40, t=20, b=20), showlegend=False)
-            fig.update_xaxes(title="点赞数")
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col_right:
-            ip_dist = comments["ip_location"].value_counts().head(15)
-            fig = px.pie(values=ip_dist.values, names=ip_dist.index, title="评论 IP 属地分布")
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.divider()
-        if "create_time_dt" in comments.columns:
-            comments_copy = comments.copy()
-            comments_copy["comment_date"] = comments_copy["create_time_dt"].dt.date
-            daily_comments = comments_copy["comment_date"].value_counts().sort_index()
-            fig = px.bar(
-                x=daily_comments.index, y=daily_comments.values,
-                title="每日评论数趋势", labels={"x": "日期", "y": "评论数"},
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("📄 评论原始数据"):
-            st.dataframe(
-                comments.sort_values("like_count", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
-    else:
-        st.warning("未加载评论数据")
-
-
-# ============================================================
-# Tab 5: 同行分析
+# Tab 4: 同行分析
 # ============================================================
 MY_SHOP_USER_ID = "5d0cf92a0000000012020861"
 MY_SHOP_NAME = "wireless shop无线商店"
