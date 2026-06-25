@@ -21,6 +21,65 @@ except Exception:
 import db
 import auth
 
+
+@st.dialog("💬 笔记评论", width="large")
+def show_comments_dialog(note_id, note_title, note_url):
+    st.markdown(f"**📌 [{note_title}]({note_url})**" if note_url else f"**📌 {note_title}")
+
+    client = db.connect()
+    if not client:
+        st.error("无法连接 Supabase")
+        return
+
+    with st.spinner("加载评论中..."):
+        comments_df = db.query_xhs_note_comments(client)
+        note_comments = pd.DataFrame()
+        if not comments_df.empty and "note_id" in comments_df.columns:
+            note_comments = comments_df[comments_df["note_id"] == note_id].copy()
+
+    if note_comments.empty:
+        st.info("该笔记暂无评论")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("评论总数", len(note_comments))
+    col2.metric("总点赞", f"{note_comments['like_count'].astype(int).sum():,}")
+    col3.metric("评论用户", note_comments["user_id"].nunique())
+
+    st.divider()
+
+    if "create_time" in note_comments.columns:
+        note_comments["评论时间"] = pd.to_datetime(
+            note_comments["create_time"], unit="ms", errors="coerce"
+        ).dt.strftime("%Y-%m-%d %H:%M")
+
+    display_cols = [c for c in ["content", "like_count", "nickname", "ip_location", "评论时间", "sub_comment_count"] if c in note_comments.columns]
+
+    st.dataframe(
+        note_comments.sort_values("like_count", ascending=False)[display_cols],
+        column_config={
+            "content": "评论内容",
+            "like_count": "点赞",
+            "nickname": "用户",
+            "ip_location": "IP属地",
+            "评论时间": "时间",
+            "sub_comment_count": "回复数",
+        },
+        use_container_width=True,
+        hide_index=True,
+        height=700,
+    )
+
+    st.divider()
+    st.subheader("IP 属地分布")
+    if "ip_location" in note_comments.columns:
+        ip_dist = note_comments["ip_location"].value_counts().head(15)
+        if not ip_dist.empty:
+            import plotly.express as px
+            fig = px.pie(values=ip_dist.values, names=ip_dist.index, title="评论 IP 属地")
+            st.plotly_chart(fig, use_container_width=True)
+
+
 st.set_page_config(page_title="XHS 运营分析", page_icon="📊", layout="wide")
 st.title("📊 小红书「原创车贴」运营分析")
 
@@ -107,6 +166,7 @@ with st.sidebar:
                 comments_data = clean_numeric_cols(comments_data, ["like_count", "sub_comment_count"])
                 comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
             st.session_state.comments = comments_data
+            st.session_state.commented_note_ids = db.get_commented_note_ids(client)
             st.session_state.hot_all = db.query_hot_posts(client)
             st.session_state.hot_normal = db.query_hot_posts(client, post_type="normal")
             st.session_state.hot_video = db.query_hot_posts(client, post_type="video")
@@ -225,23 +285,31 @@ with tab_hot:
         st.subheader("💬 查看笔记评论")
         note_opts_cols = [c for c in ["note_id", "title", "nickname", "comment_count", "note_url"] if c in df_hot.columns]
         note_options = df_hot[note_opts_cols].copy()
-        note_options["label"] = note_options.apply(
-            lambda r: f"[{r['comment_count']}评] {r['title'][:50]} — @{r['nickname']} ({r['note_id'][:12]}...)",
-            axis=1,
-        )
-        note_options = note_options.sort_values("comment_count", ascending=False)
-        selected_note_label = st.selectbox(
-            "选择笔记查看评论",
-            note_options["label"].tolist(),
-            key="comment_view_selector",
-        )
-        if selected_note_label:
-            sel_row = note_options[note_options["label"] == selected_note_label].iloc[0]
-            if st.button("📥 查看评论", key="load_comments_btn", type="primary"):
-                st.session_state.view_note_id = sel_row["note_id"]
-                st.session_state.view_note_title = sel_row["title"]
-                st.session_state.view_note_url = sel_row["note_url"] if "note_url" in sel_row.index else ""
-                st.switch_page("pages/_comments.py")
+        # 只看 xhs_note_comment 表中实际有评论的帖子
+        commented_ids = st.session_state.get("commented_note_ids", set())
+        if commented_ids:
+            note_options = note_options[note_options["note_id"].isin(commented_ids)]
+        if note_options.empty:
+            st.info("暂无有评论的帖子")
+        else:
+            note_options["label"] = note_options.apply(
+                lambda r: f"[{r['comment_count']}评] {r['title'][:50]} — @{r['nickname']} ({r['note_id'][:12]}...)",
+                axis=1,
+            )
+            note_options = note_options.sort_values("comment_count", ascending=False)
+            selected_note_label = st.selectbox(
+                "选择笔记查看评论",
+                note_options["label"].tolist(),
+                key="comment_view_selector",
+            )
+            if selected_note_label:
+                sel_row = note_options[note_options["label"] == selected_note_label].iloc[0]
+                if st.button("📥 查看评论", key="load_comments_btn", type="primary"):
+                    show_comments_dialog(
+                        sel_row["note_id"],
+                        sel_row["title"],
+                        sel_row["note_url"] if "note_url" in sel_row.index else "",
+                    )
 
         st.divider()
 
@@ -716,8 +784,8 @@ with tab_content:
     with col_c:
         st.markdown("**描述字数**")
         fig = go.Figure()
-        fig.add_trace(go.Histogram(x=df["desc_len"], name="全部", marker_color="#b0c4de", opacity=0.7, nbinsx=20))
-        fig.add_trace(go.Histogram(x=df[hot_mask]["desc_len"], name="热门 (Top 30%)", marker_color="#ff6b6b", nbinsx=20))
+        fig.add_trace(go.Histogram(x=df["desc_len"], name="全部", marker_color="#b0c4de", opacity=0.7, xbins=dict(size=10)))
+        fig.add_trace(go.Histogram(x=df[hot_mask]["desc_len"], name="热门 (Top 30%)", marker_color="#ff6b6b", xbins=dict(size=10)))
         fig.update_layout(title="描述字数分布", xaxis=dict(title="字数"), yaxis=dict(title="帖子数"), height=350, margin=dict(l=20, r=20, t=40, b=20), barmode="overlay")
         st.plotly_chart(fig, use_container_width=True)
 

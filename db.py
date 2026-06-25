@@ -466,6 +466,24 @@ def query_xhs_note_comments(client: Client) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def get_commented_note_ids(client: Client) -> set:
+    """返回 xhs_note_comment 表中有评论的所有 note_id"""
+    if not client:
+        return set()
+    ids = set()
+    start, limit = 0, 1000
+    while True:
+        res = client.table("xhs_note_comment").select("note_id").range(start, start + limit - 1).execute()
+        if not res.data:
+            break
+        for row in res.data:
+            ids.add(row["note_id"])
+        if len(res.data) < limit:
+            break
+        start += limit
+    return ids
+
+
 def query_creators(client: Client) -> pd.DataFrame:
     """Fetch all xhs_creator records from Supabase."""
     if not client:

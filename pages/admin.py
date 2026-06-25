@@ -1,10 +1,16 @@
 import streamlit as st
 import pandas as pd
 import sys, os
+import subprocess
+import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auth
 import db
+
+MEDIACRAWLER_DIR = "/Users/zion/Desktop/MediaCrawler/MediaCrawler"
+MEDIACRAWLER_PYTHON = os.path.join(MEDIACRAWLER_DIR, ".venv", "bin", "python")
+CRAWL_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crawl_logs")
 
 st.set_page_config(page_title="管理后台", page_icon="🔧", layout="wide")
 
@@ -45,7 +51,7 @@ if "db_conn" not in st.session_state:
 
 client = st.session_state.db_conn
 
-tab1, tab2, tab3 = st.tabs(["📊 数据库管理", "👤 用户管理", "📥 CSV 导入"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 数据库管理", "👤 用户管理", "📥 CSV 导入", "🚀 爬虫控制"])
 
 with tab1:
     st.subheader("数据库统计")
@@ -157,3 +163,149 @@ with tab3:
             st.session_state.db_stats = db.table_stats(client)
             c1 = r1["inserted"]; u1 = r1["updated"]; c2 = r2["inserted"]; u2 = r2["updated"]
             st.success(f"帖子: 新增 {c1} 条, 更新 {u1} 条 | 评论: 新增 {c2} 条, 更新 {u2} 条")
+
+
+with tab4:
+    st.subheader("🚀 MediaCrawler 爬取控制")
+    st.caption("对单条笔记触发详情爬取，含评论（最多 200 条）")
+
+    # Check if a crawl is already running
+    crawl_running = False
+    if "last_crawl" in st.session_state:
+        lc = st.session_state.last_crawl
+        pid = lc.get("pid")
+        if pid:
+            try:
+                os.kill(pid, 0)  # signal 0 = check if process exists
+                crawl_running = True
+            except OSError:
+                crawl_running = False
+
+    if crawl_running:
+        lc = st.session_state.last_crawl
+        col_warn, col_stop = st.columns([3, 1])
+        with col_warn:
+            st.warning(f"⚠️ 爬虫正在运行中 (PID: {lc['pid']}, 启动于 {lc.get('started_at', '')})")
+        with col_stop:
+            if st.button("🛑 强制中断", type="secondary", use_container_width=True):
+                try:
+                    os.kill(lc["pid"], 9)  # SIGKILL
+                    st.session_state.last_crawl["pid"] = None
+                    st.success("已发送中断信号")
+                    st.rerun()
+                except OSError as e:
+                    st.error(f"中断失败: {e}")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        note_id = st.text_input(
+            "笔记 ID (note_id)",
+            placeholder="粘贴小红书的 note_id，例如 6a37d5ef000000000f01f2b6",
+            disabled=crawl_running,
+        )
+    with col2:
+        max_comments = st.slider("最大评论数", 10, 200, 200, step=10, disabled=crawl_running)
+
+    # Proxy settings
+    with st.expander("🌐 代理设置"):
+        enable_proxy = st.checkbox("启用 IP 代理", value=True, disabled=crawl_running)
+        proxy_provider = st.selectbox(
+            "代理服务商",
+            ["kuaidaili", "kuaidaili_kps", "wandouhttp", "static"],
+            index=0,
+            disabled=(not enable_proxy or crawl_running),
+        )
+
+    if st.button("🚀 启动爬取", type="primary", disabled=(not note_id or crawl_running), use_container_width=True):
+        # Fetch xsec_token from Supabase
+        with st.spinner("查询笔记信息..."):
+            try:
+                res = client.table("xhs_note").select("note_id,xsec_token,title,nickname").eq("note_id", note_id).execute()
+                note_data = res.data[0] if res.data else None
+            except Exception as e:
+                st.error(f"查询 Supabase 失败: {e}")
+                st.stop()
+
+        if not note_data:
+            st.error(f"未找到笔记 `{note_id}`，请先通过 CSV 导入或搜索爬取入库")
+            st.stop()
+
+        xsec_token = note_data.get("xsec_token", "")
+        if xsec_token:
+            url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source=pc_search"
+        else:
+            url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_source=pc_search"
+
+        title = str(note_data.get("title", ""))[:60]
+        nickname = note_data.get("nickname", "")
+
+        st.info(f"**目标**: [{title}]({url}) — @{nickname}")
+
+        # Build command
+        cmd = [
+            MEDIACRAWLER_PYTHON, "main.py",
+            "--platform", "xhs",
+            "--lt", "cookie",
+            "--type", "detail",
+            "--specified_id", url,
+            "--get_comment", "true",
+            "--get_sub_comment", "false",
+            "--save_data_option", "postgres",
+            "--max_comments_count_singlenotes", str(max_comments),
+            "--crawler_max_notes_count", "1",
+            "--max_concurrency_num", "1",
+        ]
+
+        if enable_proxy:
+            cmd.extend([
+                "--enable_ip_proxy", "true",
+                "--ip_proxy_provider_name", proxy_provider,
+            ])
+
+        # Prepare log file
+        os.makedirs(CRAWL_LOG_DIR, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(CRAWL_LOG_DIR, f"crawl_{note_id[:12]}_{timestamp}.log")
+
+        with open(log_path, "w") as log_file:
+            log_file.write(f"=== MediaCrawler 爬取任务 ===\n")
+            log_file.write(f"Note ID: {note_id}\nURL: {url}\nMax Comments: {max_comments}\n")
+            log_file.write(f"启动时间: {datetime.datetime.now()}\nCMD: {' '.join(cmd)}\n")
+            log_file.write("=" * 50 + "\n\n")
+
+            process = subprocess.Popen(
+                cmd,
+                cwd=MEDIACRAWLER_DIR,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+
+        st.session_state.last_crawl = {
+            "note_id": note_id,
+            "title": title,
+            "nickname": nickname,
+            "url": url,
+            "max_comments": max_comments,
+            "log_path": log_path,
+            "pid": process.pid,
+            "started_at": timestamp,
+        }
+
+        st.success(f"✅ 爬虫已启动 (PID: {process.pid})")
+        st.caption(f"日志文件: `{log_path}`")
+
+    # Show last crawl info
+    if "last_crawl" in st.session_state:
+        lc = st.session_state.last_crawl
+        st.divider()
+        st.caption("**上次爬取任务**")
+        st.json({
+            "note_id": lc["note_id"],
+            "标题": lc.get("title", ""),
+            "作者": lc.get("nickname", ""),
+            "评论上限": lc["max_comments"],
+            "PID": lc["pid"],
+            "启动时间": lc["started_at"],
+            "日志文件": lc["log_path"],
+        })
