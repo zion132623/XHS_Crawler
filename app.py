@@ -21,7 +21,7 @@ import auth
 for _mod_name in [
     "analytics.common", "analytics.hot_ranking",
     "analytics.time_optimization", "analytics.content_strategy",
-    "analytics.peer_analysis",
+    "analytics.peer_analysis", "analytics.comments",
 ]:
     if _mod_name in sys.modules:
         importlib.reload(sys.modules[_mod_name])
@@ -31,6 +31,7 @@ import analytics.hot_ranking as hot_mod
 import analytics.time_optimization as time_mod
 import analytics.content_strategy as content_mod
 import analytics.peer_analysis as peer_mod
+import analytics.comments as comments_mod
 from analytics.common import clean_numeric_cols, enrich_time_cols
 
 
@@ -53,6 +54,24 @@ def show_comments_dialog(note_id, note_title, note_url):
         st.info("该笔记暂无评论")
         return
 
+    # ---- 数据预处理 ----
+    for _col in ["like_count", "sub_comment_count"]:
+        if _col in note_comments.columns:
+            note_comments[_col] = note_comments[_col].apply(db._safe_int)
+
+    if "create_time" in note_comments.columns:
+        note_comments["评论时间"] = pd.to_datetime(
+            note_comments["create_time"], unit="ms", errors="coerce"
+        ).dt.strftime("%Y-%m-%d %H:%M")
+
+    note_comments["display_content"] = note_comments["content"].apply(
+        lambda x: x if (x and str(x).strip()) else "[图片]"
+    )
+    note_comments["has_pic"] = note_comments["pictures"].apply(
+        lambda p: bool(p and str(p) not in ('""', '[]', '') and 'http' in str(p))
+    )
+
+    # ---- 顶部统计 ----
     col1, col2, col3 = st.columns(3)
     col1.metric("评论总数", len(note_comments))
     col2.metric("总点赞", f"{note_comments['like_count'].astype(int).sum():,}")
@@ -60,17 +79,17 @@ def show_comments_dialog(note_id, note_title, note_url):
 
     st.divider()
 
-    if "create_time" in note_comments.columns:
-        note_comments["评论时间"] = pd.to_datetime(
-            note_comments["create_time"], unit="ms", errors="coerce"
-        ).dt.strftime("%Y-%m-%d %H:%M")
-
-    display_cols = [c for c in ["content", "like_count", "nickname", "ip_location", "评论时间", "sub_comment_count"] if c in note_comments.columns]
+    display_cols = [
+        c for c in ["display_content", "has_pic", "like_count", "nickname",
+                     "ip_location", "评论时间", "sub_comment_count"]
+        if c in note_comments.columns
+    ]
 
     st.dataframe(
         note_comments.sort_values("like_count", ascending=False)[display_cols],
         column_config={
-            "content": "评论内容",
+            "display_content": "评论内容",
+            "has_pic": st.column_config.CheckboxColumn("有图"),
             "like_count": "点赞",
             "nickname": "用户",
             "ip_location": "IP属地",
@@ -111,6 +130,43 @@ if not auth.is_logged_in():
     st.stop()
 
 
+def _init_hot_ranking(client):
+    """读宽表，表空则计算三种 post_type 并写入."""
+    try:
+        loaded = db.load_hot_ranking(client)
+        if not loaded.empty:
+            return _split_ranking(loaded)
+    except Exception as e:
+        st.warning(f"读表失败: {e}")
+
+    df_all = db.query_hot_posts(client)
+    df_normal = db.query_hot_posts(client, post_type="normal")
+    df_video = db.query_hot_posts(client, post_type="video")
+    try:
+        db.save_hot_ranking(client, df_all, df_normal, df_video)
+    except Exception as e:
+        st.warning(f"写表失败: {e}")
+    return {"hot_all": df_all, "hot_normal": df_normal, "hot_video": df_video}
+
+
+def _split_ranking(wide_df):
+    """宽表拆回三个 DataFrame（按 rank_all/rank_normal/rank_video 过滤排序）."""
+    import pandas as pd
+
+    def _extract(rank_col):
+        df = wide_df[wide_df[rank_col].notna()].copy()
+        df = df.sort_values(rank_col)
+        df = df.drop(columns=["id", "entry_time", "exit_time",
+                              "rank_all", "rank_normal", "rank_video"], errors="ignore")
+        return df
+
+    return {
+        "hot_all": _extract("rank_all"),
+        "hot_normal": _extract("rank_normal"),
+        "hot_video": _extract("rank_video"),
+    }
+
+
 # ==================== 侧边栏 ====================
 with st.sidebar:
     st.header("📂 数据管理")
@@ -135,9 +191,11 @@ with st.sidebar:
                 comments_data["create_time_dt"] = pd.to_datetime(comments_data["create_time"], unit="ms")
             st.session_state.comments = comments_data
             st.session_state.commented_note_ids = db.get_commented_note_ids(client)
-            st.session_state.hot_all = db.query_hot_posts(client)
-            st.session_state.hot_normal = db.query_hot_posts(client, post_type="normal")
-            st.session_state.hot_video = db.query_hot_posts(client, post_type="video")
+            st.session_state.all_comments = comments_mod.load_all_comments(client)
+            hot_maps = _init_hot_ranking(client)
+            st.session_state.hot_all = hot_maps["hot_all"]
+            st.session_state.hot_normal = hot_maps["hot_normal"]
+            st.session_state.hot_video = hot_maps["hot_video"]
             st.session_state.creators = db.query_creators(client)
 
     st.info(
@@ -145,6 +203,21 @@ with st.sidebar:
         f"| 评论 {st.session_state.db_stats['comments']} 条 "
         f"| 创作者 {len(st.session_state.creators)} 位"
     )
+
+    if st.button("🔄 刷新热帖排行", use_container_width=True):
+        client = st.session_state.get("db_conn") or db.connect()
+        with st.spinner("重新计算热帖..."):
+            df_all = db.query_hot_posts(client)
+            df_normal = db.query_hot_posts(client, post_type="normal")
+            df_video = db.query_hot_posts(client, post_type="video")
+            try:
+                db.save_hot_ranking(client, df_all, df_normal, df_video)
+            except Exception as e:
+                st.warning(f"写表失败: {e}")
+            st.session_state.hot_all = df_all
+            st.session_state.hot_normal = df_normal
+            st.session_state.hot_video = df_video
+        st.rerun()
 
     st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
 
@@ -175,8 +248,8 @@ def _render_tab_safe(tab_name, render_func):
 
 
 # ==================== Tab 页 ====================
-tab_hot, tab_time, tab_content, tab_peers = st.tabs(
-    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "🔍 同行分析"]
+tab_hot, tab_time, tab_content, tab_peers, tab_comments = st.tabs(
+    ["🔥 热帖排行", "⏰ 发布时间优化", "📝 内容策略分析", "🔍 同行分析", "💬 评论分析"]
 )
 
 
@@ -661,6 +734,93 @@ def _render_tab_peers():
         st.info("无帖子标签数据")
 
 
+# ============================================================
+# Tab 5: 评论分析
+# ============================================================
+def _render_tab_comments():
+    all_cmt = st.session_state.get("all_comments", pd.DataFrame())
+    if all_cmt.empty:
+        st.warning("暂无评论数据")
+        return
+
+    notes_df = st.session_state.get("xhs_note", pd.DataFrame())
+
+    # ---- KPI ----
+    ov = comments_mod.build_overview(all_cmt)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("评论总数", ov["total"])
+    col2.metric("涉及笔记", ov["unique_notes"])
+    col3.metric("评论用户", ov["unique_users"])
+    col4.metric("图片率", f"{ov['pic_rate']:.1%}")
+    col5.metric("@提及率", f"{ov['at_rate']:.1%}")
+    col6.metric("留白率", f"{ov['empty_rate']:.1%}")
+
+    st.divider()
+
+    # ---- 时序 ----
+    col_l, col_r = st.columns(2)
+    with col_l:
+        fig_timeline = comments_mod.build_timeline(all_cmt)
+        st.plotly_chart(fig_timeline, use_container_width=True)
+    with col_r:
+        fig_empty = comments_mod.build_empty_trend(all_cmt)
+        st.plotly_chart(fig_empty, use_container_width=True)
+
+    st.divider()
+
+    # ---- 笔记维度 ----
+    st.subheader("📊 笔记评论排名")
+    ranking = comments_mod.build_note_comment_ranking(all_cmt, notes_df)
+    if not ranking.empty:
+        st.dataframe(
+            ranking,
+            column_config={
+                "title": "笔记标题",
+                "nickname": "作者",
+                "评论数": st.column_config.NumberColumn("评论数"),
+                "图片率": st.column_config.ProgressColumn("图片率", format="%.0f%%", min_value=0, max_value=100),
+                "at率": st.column_config.ProgressColumn("at率", format="%.0f%%", min_value=0, max_value=100),
+                "留白率": st.column_config.ProgressColumn("留白率", format="%.0f%%", min_value=0, max_value=100),
+                "总点赞": "评论点赞",
+                "评论用户": "用户数",
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+
+    # ---- 用户 + IP ----
+    col_l, col_r = st.columns([1, 1])
+    with col_l:
+        st.subheader("👤 评论用户排行")
+        commenters = comments_mod.build_commenter_ranking(all_cmt)
+        if not commenters.empty:
+            st.dataframe(
+                commenters.head(20),
+                column_config={
+                    "nickname": "用户",
+                    "评论数": "评论数",
+                    "图片评论": "图片评论",
+                    "获赞": "获赞",
+                    "平均长度": "均字数",
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+            )
+    with col_r:
+        st.subheader("🌍 IP 分布")
+        fig_ip = comments_mod.build_ip_distribution(all_cmt)
+        st.plotly_chart(fig_ip, use_container_width=True)
+
+    st.divider()
+
+    # ---- 雷达图 ----
+    st.subheader("🎯 评论质量雷达")
+    fig_radar = comments_mod.build_quality_radar(all_cmt, notes_df)
+    st.plotly_chart(fig_radar, use_container_width=True)
+
 # ==================== Render all tabs with error boundaries ====================
 with tab_hot:
     _render_tab_safe("🔥 热帖排行", _render_tab_hot)
@@ -673,3 +833,6 @@ with tab_content:
 
 with tab_peers:
     _render_tab_safe("🔍 同行分析", _render_tab_peers)
+
+with tab_comments:
+    _render_tab_safe("💬 评论分析", _render_tab_comments)

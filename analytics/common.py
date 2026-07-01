@@ -54,6 +54,15 @@ def compute_engagement(df, weights=None):
     return score
 
 
+def parse_comment_pictures(pics_str):
+    """解析评论图片字段: '' 或 'url1,url2' → URL 列表."""
+    if not pics_str or pics_str in ('""', '[]', ''):
+        return []
+    if 'http' not in pics_str:
+        return []
+    return [u.strip() for u in pics_str.split(',') if u.strip() and 'http' in u]
+
+
 def get_font_path():
     """返回系统可用的中文字体路径."""
     if platform.system() == "Darwin":

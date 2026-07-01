@@ -323,7 +323,7 @@ def _safe_int(val):
 def query_hot_posts(
     client: Client,
     limit: int = 20,
-    burst_window_hours: int = 96,
+    burst_window_hours: int = 720,
     alpha: float = 2.0,
     r: float = 1.5,
     beta: float = 4.0,
@@ -366,7 +366,13 @@ def query_hot_posts(
     # Hot score: stock engagement with power-law decay
     df["hot_score"] = df["score_base"] / (df["hours_ago"].clip(lower=0.1) + alpha) ** r
 
-    # Fetch increasing deltas in the burst window
+    # ================================================================
+    # score_burst: 双信号加权
+    #   信号1 (30%): increasing 表增量速度，归一化到增长率
+    #   信号2 (70%): 评论质量 — @率 + 图片率 + 评论流速
+    # ================================================================
+
+    # ---- 信号1: increasing 表增量 ----
     cutoff = (now - pd.Timedelta(hours=burst_window_hours)).isoformat()
     inc_data = []
     try:
@@ -388,6 +394,7 @@ def query_hot_posts(
     except Exception:
         pass
 
+    burst_inc_map = {}
     if inc_data:
         inc_df = pd.DataFrame(inc_data)
         for c in ["liked_count", "collected_count", "comment_count", "share_count"]:
@@ -401,25 +408,83 @@ def query_hot_posts(
             + inc_df["collected_count"] * 5
         )
 
-        agg = inc_df.groupby("note_id").agg(
-            score_burst=("burst_heat", "sum"),
-            last_delta=("record_time", "max"),
-        ).reset_index()
+        for nid, grp in inc_df.groupby("note_id"):
+            grp = grp.sort_values("record_time")
+            if len(grp) > 1:
+                # 增量 = 最新累计 − 最早累计
+                delta = grp["burst_heat"].iloc[-1] - grp["burst_heat"].iloc[0]
+                hours_span = (
+                    pd.to_datetime(grp["record_time"].iloc[-1], utc=True)
+                    - pd.to_datetime(grp["record_time"].iloc[0], utc=True)
+                ).total_seconds() / 3600.0
+                hours_span = max(hours_span, 0.1)
+                last_time = grp["record_time"].iloc[-1]
+            else:
+                delta = grp["burst_heat"].iloc[0]
+                hours_span = 1.0
+                last_time = grp["record_time"].iloc[0]
 
-        agg["hours_since_delta"] = (
-            now - pd.to_datetime(agg["last_delta"], utc=True)
-        ).dt.total_seconds() / 3600.0
+            # 归一化增速 + 时间衰减
+            base = df.loc[df["note_id"] == nid, "score_base"]
+            base_val = base.iloc[0] if len(base) > 0 else 1
+            velocity_inc = delta / hours_span / math.sqrt(base_val + 1)
 
-        agg["score_burst"] = agg["score_burst"] / (
-            agg["hours_since_delta"].clip(lower=0.01) + beta
-        ) ** lambd
+            hours_since = (
+                now - pd.to_datetime(last_time, utc=True)
+            ).total_seconds() / 3600.0
 
-        df = df.merge(
-            agg[["note_id", "score_burst"]], on="note_id", how="left"
-        )
-        df["score_burst"] = df["score_burst"].fillna(0)
-    else:
-        df["score_burst"] = 0
+            burst_inc_map[nid] = velocity_inc / (
+                max(hours_since, 0.01) + beta
+            ) ** lambd
+
+    # ---- 信号2: 评论质量 ----
+    cmt_data = []
+    try:
+        cmt_start, cmt_limit = 0, 1000
+        while True:
+            cmt_res = (
+                client.table("xhs_note_comment")
+                .select("note_id,content,pictures")
+                .range(cmt_start, cmt_start + cmt_limit - 1)
+                .execute()
+            )
+            if not cmt_res.data:
+                break
+            cmt_data.extend(cmt_res.data)
+            if len(cmt_res.data) < cmt_limit:
+                break
+            cmt_start += cmt_limit
+    except Exception:
+        pass
+
+    burst_cmt_map = {}
+    if cmt_data:
+        cmt_df = pd.DataFrame(cmt_data)
+
+        for nid in df["note_id"]:
+            nc = cmt_df[cmt_df["note_id"] == nid]
+            total = len(nc)
+            if total == 0:
+                burst_cmt_map[nid] = 0.0
+                continue
+
+            content = nc["content"].fillna("")
+            at_count = content.apply(lambda x: "@" in str(x)).sum()
+            pictures = nc["pictures"].fillna("")
+            pic_count = pictures.apply(
+                lambda p: bool(p and str(p) not in ('""', '[]', '') and "http" in str(p))
+            ).sum()
+
+            at_rate = at_count / total
+            pic_rate = pic_count / total
+            velocity = total / (df.loc[df["note_id"] == nid, "score_base"].iloc[0] + 1)
+
+            burst_cmt_map[nid] = 0.4 * velocity + 0.3 * at_rate + 0.3 * pic_rate
+
+    # ---- 合并 ----
+    df["burst_inc"] = df["note_id"].map(burst_inc_map).fillna(0.0)
+    df["burst_cmt"] = df["note_id"].map(burst_cmt_map).fillna(0.0)
+    df["score_burst"] = 0.3 * df["burst_inc"] + 0.7 * df["burst_cmt"]
 
     # Final score: stock × burst multiplier × keyword multiplier
     df["keyword_count"] = df.get("source_keyword", "").fillna("").apply(
@@ -482,6 +547,110 @@ def get_commented_note_ids(client: Client) -> set:
             break
         start += limit
     return ids
+
+
+def save_hot_ranking(client: Client, df_all: pd.DataFrame, df_normal: pd.DataFrame = None, df_video: pd.DataFrame = None):
+    """宽表 UPSERT：一个 note_id 一行，rank_all/rank_normal/rank_video 三个列."""
+    if not client:
+        return
+
+    now_ts = pd.Timestamp.now(tz="UTC").isoformat()
+
+    # 合并三种 post_type 的 rank 到一张宽表
+    merged = {}  # note_id → {rank_all, rank_normal, rank_video, ...}
+
+    def _add_ranks(df, col_name):
+        if df is None or df.empty:
+            return
+        for rank, (_, row) in enumerate(df.iterrows(), start=1):
+            nid = row["note_id"]
+            if nid not in merged:
+                merged[nid] = {
+                    "rank_all": None, "rank_normal": None, "rank_video": None,
+                    "title": row.get("title"), "nickname": row.get("nickname"),
+                    "note_url": row.get("note_url"),
+                    "liked_count": _safe_int(row.get("liked_count")),
+                    "collected_count": _safe_int(row.get("collected_count")),
+                    "comment_count": _safe_int(row.get("comment_count")),
+                    "share_count": _safe_int(row.get("share_count")),
+                    "hours_ago": row.get("hours_ago"),
+                    "score_base": row.get("score_base"),
+                    "hot_score": row.get("hot_score"),
+                    "score_burst": row.get("score_burst"),
+                    "keyword_count": row.get("keyword_count"),
+                    "final_score": row.get("final_score"),
+                    "source_keyword": row.get("source_keyword"),
+                }
+            merged[nid][col_name] = rank
+
+    _add_ranks(df_all, "rank_all")
+    _add_ranks(df_normal, "rank_normal")
+    _add_ranks(df_video, "rank_video")
+
+    curr_ids = set(merged.keys())
+
+    # 查已有记录
+    existing = {}  # note_id → entry_time
+    prev_ids = set()
+    start, limit = 0, 1000
+    while True:
+        res = (
+            client.table("hot_ranking_snapshot")
+            .select("note_id,entry_time")
+            .range(start, start + limit - 1)
+            .execute()
+        )
+        if not res.data:
+            break
+        for r in res.data:
+            existing[r["note_id"]] = r.get("entry_time")
+            prev_ids.add(r["note_id"])
+        if len(res.data) < limit:
+            break
+        start += limit
+
+    # UPSERT 当前在榜
+    for nid, fields in merged.items():
+        rec = {"note_id": nid, **fields}
+        rec["entry_time"] = existing.get(nid, now_ts)
+        rec["exit_time"] = None  # 在榜就清掉 exit_time（重新上榜场景）
+        client.table("hot_ranking_snapshot").upsert(
+            rec, on_conflict="note_id"
+        ).execute()
+
+    # 下榜
+    dropped = prev_ids - curr_ids
+    for nid in dropped:
+        client.table("hot_ranking_snapshot").update({"exit_time": now_ts}) \
+            .eq("note_id", nid) \
+            .is_("exit_time", "null") \
+            .execute()
+
+
+def load_hot_ranking(client: Client) -> pd.DataFrame:
+    """读取当前在榜记录（exit_time IS NULL），按 rank_all 排序."""
+    if not client:
+        return pd.DataFrame()
+
+    data = []
+    start, limit = 0, 1000
+    while True:
+        res = (
+            client.table("hot_ranking_snapshot")
+            .select("*")
+            .is_("exit_time", "null")
+            .order("rank_all", desc=False)
+            .range(start, start + limit - 1)
+            .execute()
+        )
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < limit:
+            break
+        start += limit
+
+    return pd.DataFrame(data)
 
 
 def query_creators(client: Client) -> pd.DataFrame:
