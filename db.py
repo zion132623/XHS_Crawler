@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from typing import Optional
+from typing import Optional, List
 from supabase import create_client, Client
 
 
@@ -318,6 +318,181 @@ def _safe_int(val):
         return int(float(s))
     except (ValueError, TypeError):
         return 0
+
+
+def calc_hot_posts(
+    client: Client,
+    df_input: pd.DataFrame,
+    limit: int = 100,
+    burst_window_hours: int = 720,
+    alpha: float = 2.0,
+    r: float = 1.5,
+    beta: float = 4.0,
+    lambd: float = 1.5,
+) -> pd.DataFrame:
+    """从已筛选的笔记 DataFrame 计算热帖分数并返回排序结果.
+
+    用于一级分类切换时独立重新计算该分类下的排行榜.
+    """
+    if df_input.empty:
+        return pd.DataFrame()
+
+    import math
+
+    df = df_input.copy()
+    now = pd.Timestamp.now(tz="UTC")
+
+    for c in ["liked_count", "collected_count", "comment_count", "share_count"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_safe_int)
+
+    df["publish_time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df["hours_ago"] = (now - df["publish_time"]).dt.total_seconds() / 3600.0
+
+    df["score_base"] = (
+        df["liked_count"]
+        + df["share_count"] * 3
+        + df["comment_count"] * 4
+        + df["collected_count"] * 5
+    )
+
+    df["hot_score"] = df["score_base"] / (df["hours_ago"].clip(lower=0.1) + alpha) ** r
+
+    # ---- 信号1: increasing 表增量 ----
+    cutoff = (now - pd.Timedelta(hours=burst_window_hours)).isoformat()
+    inc_data = []
+    try:
+        inc_start, inc_limit = 0, 1000
+        while True:
+            inc_res = (
+                client.table("increasing")
+                .select("*")
+                .gte("record_time", cutoff)
+                .range(inc_start, inc_start + inc_limit - 1)
+                .execute()
+            )
+            if not inc_res.data:
+                break
+            inc_data.extend(inc_res.data)
+            if len(inc_res.data) < inc_limit:
+                break
+            inc_start += inc_limit
+    except Exception:
+        pass
+
+    burst_inc_map = {}
+    if inc_data:
+        inc_df = pd.DataFrame(inc_data)
+        for c in ["liked_count", "collected_count", "comment_count", "share_count"]:
+            if c in inc_df.columns:
+                inc_df[c] = inc_df[c].fillna(0).astype(int)
+
+        inc_df["burst_heat"] = (
+            inc_df["liked_count"]
+            + inc_df["share_count"] * 3
+            + inc_df["comment_count"] * 4
+            + inc_df["collected_count"] * 5
+        )
+
+        for nid, grp in inc_df.groupby("note_id"):
+            grp = grp.sort_values("record_time")
+            if len(grp) > 1:
+                delta = grp["burst_heat"].iloc[-1] - grp["burst_heat"].iloc[0]
+                hours_span = (
+                    pd.to_datetime(grp["record_time"].iloc[-1], utc=True)
+                    - pd.to_datetime(grp["record_time"].iloc[0], utc=True)
+                ).total_seconds() / 3600.0
+                hours_span = max(hours_span, 0.1)
+                last_time = grp["record_time"].iloc[-1]
+            else:
+                delta = grp["burst_heat"].iloc[0]
+                hours_span = 1.0
+                last_time = grp["record_time"].iloc[0]
+
+            base = df.loc[df["note_id"] == nid, "score_base"]
+            base_val = base.iloc[0] if len(base) > 0 else 1
+            velocity_inc = delta / hours_span / math.sqrt(base_val + 1)
+
+            hours_since = (
+                now - pd.to_datetime(last_time, utc=True)
+            ).total_seconds() / 3600.0
+
+            burst_inc_map[nid] = velocity_inc / (
+                max(hours_since, 0.01) + beta
+            ) ** lambd
+
+    # ---- 信号2: 评论质量 ----
+    cmt_data = []
+    try:
+        cmt_start, cmt_limit = 0, 1000
+        while True:
+            cmt_res = (
+                client.table("xhs_note_comment")
+                .select("note_id,content,pictures")
+                .range(cmt_start, cmt_start + cmt_limit - 1)
+                .execute()
+            )
+            if not cmt_res.data:
+                break
+            cmt_data.extend(cmt_res.data)
+            if len(cmt_res.data) < cmt_limit:
+                break
+            cmt_start += cmt_limit
+    except Exception:
+        pass
+
+    burst_cmt_map = {}
+    if cmt_data:
+        cmt_df = pd.DataFrame(cmt_data)
+
+        for nid in df["note_id"]:
+            nc = cmt_df[cmt_df["note_id"] == nid]
+            total = len(nc)
+            if total == 0:
+                burst_cmt_map[nid] = 0.0
+                continue
+
+            content = nc["content"].fillna("")
+            at_count = content.apply(lambda x: "@" in str(x)).sum()
+            pictures = nc["pictures"].fillna("")
+            pic_count = pictures.apply(
+                lambda p: bool(p and str(p) not in ('""', '[]', '') and "http" in str(p))
+            ).sum()
+
+            at_rate = at_count / total
+            pic_rate = pic_count / total
+            velocity = total / (df.loc[df["note_id"] == nid, "score_base"].iloc[0] + 1)
+
+            burst_cmt_map[nid] = 0.4 * velocity + 0.3 * at_rate + 0.3 * pic_rate
+
+    df["burst_inc"] = df["note_id"].map(burst_inc_map).fillna(0.0)
+    df["burst_cmt"] = df["note_id"].map(burst_cmt_map).fillna(0.0)
+    df["score_burst"] = 0.3 * df["burst_inc"] + 0.7 * df["burst_cmt"]
+
+    df["keyword_count"] = df.get("source_keyword", "").fillna("").apply(
+        lambda x: len([k.strip() for k in str(x).split(",") if k.strip()]) if x else 1
+    )
+    df["kw_multiplier"] = 1 + df["keyword_count"].apply(lambda x: math.log(x) * 0.08 if x > 1 else 0)
+    df["final_score"] = df["hot_score"] * (1 + df["score_burst"]) * df["kw_multiplier"]
+
+    result_cols = [
+        "note_id", "title", "nickname", "note_url",
+        "liked_count", "collected_count", "comment_count", "share_count",
+        "hours_ago", "score_base", "hot_score", "score_burst",
+        "keyword_count", "source_keyword", "final_score",
+    ]
+    if "type" in df.columns:
+        result_cols.insert(3, "type")
+    result = df[result_cols].copy()
+
+    result["score_base"] = result["score_base"].round(1)
+    result["hot_score"] = result["hot_score"].round(2)
+    result["score_burst"] = result["score_burst"].round(4)
+    result["final_score"] = result["final_score"].round(2)
+    result["hours_ago"] = result["hours_ago"].round(1)
+
+    result = result.sort_values("final_score", ascending=False).head(limit)
+    return result
 
 
 def query_hot_posts(
@@ -653,6 +828,90 @@ def load_hot_ranking(client: Client) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def save_hot_ranking_by_level1(client: Client, level1_hot_map: dict):
+    """按一级分类存储热帖到 hot_ranking_by_level1 表.
+
+    level1_hot_map: {level1_name: df_hot}  df_hot 需要有 note_id, rank, title 等字段
+
+    注意：该表需要提前创建，SQL 如下：
+    CREATE TABLE IF NOT EXISTS hot_ranking_by_level1 (
+        id SERIAL PRIMARY KEY,
+        note_id TEXT NOT NULL,
+        level1 TEXT NOT NULL,
+        rank INTEGER,
+        title TEXT,
+        nickname TEXT,
+        note_url TEXT,
+        liked_count INTEGER,
+        collected_count INTEGER,
+        comment_count INTEGER,
+        share_count INTEGER,
+        hours_ago FLOAT,
+        score_base FLOAT,
+        hot_score FLOAT,
+        score_burst FLOAT,
+        keyword_count INTEGER,
+        source_keyword TEXT,
+        final_score FLOAT,
+        entry_time TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_level1 ON hot_ranking_by_level1(level1);
+    """
+    if not client:
+        return
+
+    now_ts = pd.Timestamp.now(tz="UTC").isoformat()
+
+    # 清空该表（因为是全量刷新）
+    try:
+        client.table("hot_ranking_by_level1").delete().neq("note_id", "__placeholder__").execute()
+    except Exception:
+        pass  # 表不存在会抛异常，跳过清空
+
+    # 写入各分类数据
+    for level1, df in level1_hot_map.items():
+        if df is None or df.empty:
+            continue
+        for rank, (_, row) in enumerate(df.iterrows(), start=1):
+            rec = {
+                "note_id": row["note_id"],
+                "level1": level1,
+                "rank": rank,
+                "title": row.get("title"),
+                "nickname": row.get("nickname"),
+                "note_url": row.get("note_url"),
+                "liked_count": _safe_int(row.get("liked_count")),
+                "collected_count": _safe_int(row.get("collected_count")),
+                "comment_count": _safe_int(row.get("comment_count")),
+                "share_count": _safe_int(row.get("share_count")),
+                "hours_ago": row.get("hours_ago"),
+                "score_base": row.get("score_base"),
+                "hot_score": row.get("hot_score"),
+                "score_burst": row.get("score_burst"),
+                "keyword_count": row.get("keyword_count"),
+                "source_keyword": row.get("source_keyword"),
+                "final_score": row.get("final_score"),
+                "entry_time": now_ts,
+            }
+            client.table("hot_ranking_by_level1").insert(rec).execute()
+
+
+def load_hot_ranking_by_level1(client: Client, level1: str = None) -> pd.DataFrame:
+    """读取 hot_ranking_by_level1 表数据.
+
+    level1 为 None 时读取全部，否则只读指定分类.
+    """
+    if not client:
+        return pd.DataFrame()
+
+    query = client.table("hot_ranking_by_level1").select("*")
+    if level1:
+        query = query.eq("level1", level1)
+    res = query.execute()
+
+    return pd.DataFrame(res.data or [])
+
+
 def query_creators(client: Client) -> pd.DataFrame:
     """Fetch all xhs_creator records from Supabase."""
     if not client:
@@ -691,3 +950,77 @@ def parse_tags(tag_list_raw):
         return {}
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+# ==================== 关键词管理 ====================
+
+def get_keywords(client: Client, level1: str = None, level2: str = None, search: str = None) -> list:
+    """获取关键词列表，支持按一级/二级分类筛选和搜索"""
+    if not client:
+        return []
+    query = client.table("keywords").select("*").order("created_at", desc=True)
+    if level1 and level1 != "全部":
+        query = query.eq("level1", level1)
+    if level2 and level2 != "全部":
+        query = query.eq("level2", level2)
+    if search:
+        query = query.ilike("keyword", f"%{search}%")
+    res = query.execute()
+    return res.data or []
+
+
+def get_keywords_by_level1(client: Client, level1: str) -> List[str]:
+    """返回指定一级分类下的所有关键词名。"""
+    if not client or not level1:
+        return []
+    res = client.table("keywords").select("keyword").eq("level1", level1).execute()
+    return [r["keyword"] for r in res.data if r.get("keyword")]
+
+
+def get_all_levels(client: Client) -> tuple:
+    """获取所有一级和二级分类名称"""
+    if not client:
+        return [], []
+    res = client.table("keywords").select("level1, level2").execute()
+    level1s = sorted(set(r["level1"] for r in res.data if r["level1"]))
+    level2s = sorted(set(r["level2"] for r in res.data if r["level2"]))
+    return level1s, level2s
+
+
+def create_keyword(client: Client, keyword: str, level1: str = None, level2: str = None) -> dict:
+    """创建关键词"""
+    if not client:
+        return {}
+    res = client.table("keywords").insert({
+        "keyword": keyword.strip(),
+        "level1": level1 or None,
+        "level2": level2 or None,
+    }).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_keyword(client: Client, keyword_id: str, level1: str = None, level2: str = None) -> bool:
+    """更新关键词的分类"""
+    if not client:
+        return False
+    client.table("keywords").update({
+        "level1": level1 or None,
+        "level2": level2 or None,
+        "updated_at": "now()",
+    }).eq("id", keyword_id).execute()
+    return True
+
+
+def delete_keyword(client: Client, keyword_id: str) -> bool:
+    """删除关键词"""
+    if not client:
+        return False
+    client.table("keywords").delete().eq("id", keyword_id).execute()
+    return True
+
+
+def add_level(client: Client, level: str, tier: int) -> bool:
+    """新增一个一级或二级分类名称（只是给已有关键词设置值用，实际存在关键词的level字段里）"""
+    # 分类名直接存在 keywords 表的 level1/level2 字段中，不需要单独存储
+    # 这个函数可以用于未来扩展独立分类表时
+    return True

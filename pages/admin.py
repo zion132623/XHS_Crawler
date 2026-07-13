@@ -9,8 +9,8 @@ import auth
 import db
 
 MEDIACRAWLER_DIR = "/Users/zion/Desktop/MediaCrawler/MediaCrawler"
-MEDIACRAWLER_PYTHON = os.path.join(MEDIACRAWLER_DIR, ".venv", "bin", "python")
 CRAWL_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crawl_logs")
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 
 st.set_page_config(page_title="管理后台", page_icon="🔧", layout="wide")
 
@@ -165,9 +165,86 @@ with tab3:
             st.success(f"帖子: 新增 {c1} 条, 更新 {u1} 条 | 评论: 新增 {c2} 条, 更新 {u2} 条")
 
 
+def _run_crawl(cmd, note_id, extra_info):
+    """启动爬虫脚本（Popen），让脚本自己开 log 文件，admin 这边不写 log.
+    返回 (script_pid, log_path)，log_path 和 crawler_pid 都从脚本打印的
+    `OK ... pid=<crawler_pid> log=...` 行解析出. crawler_pid 是 MediaCrawler
+    主进程的 pid，用于判断爬虫是否还在跑.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    process = subprocess.Popen(
+        cmd,
+        cwd=MEDIACRAWLER_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    line = process.stdout.readline().strip()
+    log_path = ""
+    crawler_pid = process.pid
+    for token in line.split():
+        if token.startswith("pid="):
+            crawler_pid = int(token[len("pid="):])
+        elif token.startswith("log="):
+            log_path = token[len("log="):]
+
+    st.session_state.last_crawl = {
+        "process": process,
+        "note_id": note_id,
+        "log_path": log_path,
+        "pid": crawler_pid,
+        "started_at": timestamp,
+        **extra_info,
+    }
+    return crawler_pid, log_path
+
+
+def _launch_detail_crawl(note_id, max_comments, enable_proxy, proxy_provider):
+    """单条笔记详情 + 评论爬取 — 委派给 scripts/crawl_detail.py."""
+    client = st.session_state.db_conn
+    with st.spinner("查询笔记信息..."):
+        res = client.table("xhs_note").select("note_id,xsec_token,title,nickname").eq("note_id", note_id).execute()
+        note_data = res.data[0] if res.data else None
+    if not note_data:
+        st.error(f"未找到笔记 `{note_id}`")
+        st.stop()
+
+    title = str(note_data.get("title", ""))[:60]
+    nickname = note_data.get("nickname", "")
+
+    cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "crawl_detail.py"),
+           "--note-id", note_id, "--max-comments", str(max_comments)]
+    if enable_proxy:
+        cmd.extend(["--proxy", proxy_provider])
+
+    pid, log_path = _run_crawl(cmd, note_id, extra_info={
+        "title": title, "nickname": nickname,
+        "max_comments": max_comments, "type": "detail",
+    })
+    st.success(f"✅ 爬虫已启动 (PID: {pid})")
+
+
+def _launch_keyword_crawl(keywords, max_notes, max_comments, enable_proxy, proxy_provider):
+    """关键词搜索爬取 — 委派给 scripts/crawl_keyword.py."""
+    cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "crawl_keyword.py"),
+           "--keywords", keywords,
+           "--max-notes", str(max_notes),
+           "--max-comments", str(max_comments)]
+    if enable_proxy:
+        cmd.extend(["--proxy", proxy_provider])
+
+    kw_short = keywords.replace(" ", "_")[:20]
+    pid, log_path = _run_crawl(cmd, kw_short, extra_info={
+        "title": f"关键词: {keywords}", "nickname": "",
+        "max_comments": max_comments, "type": "search", "max_notes": max_notes,
+    })
+    st.success(f"✅ 关键词爬取已启动 (PID: {pid}, 关键词: {keywords})")
+
+
 with tab4:
     st.subheader("🚀 MediaCrawler 爬取控制")
-    st.caption("对单条笔记触发详情爬取，含评论（最多 200 条）")
 
     # Check if a crawl is already running
     crawl_running = False
@@ -196,14 +273,102 @@ with tab4:
                 except OSError as e:
                     st.error(f"中断失败: {e}")
 
+    # Load note_ids from hot ranking snapshot
+    commented_ids = set()
+    try:
+        cdata = client.table("xhs_note_comment").select("note_id").execute()
+        if cdata.data:
+            commented_ids = {r["note_id"] for r in cdata.data}
+    except Exception:
+        pass
+
+    # 一级分类筛选
+    level1s, _ = db.get_all_levels(client)
+    level1_filter = st.selectbox(
+        "🏷️ 一级分类筛选",
+        ["全部"] + level1s if level1s else ["全部"],
+        key="crawl_level1_filter",
+        disabled=crawl_running,
+    )
+
+    hot_note_opts_raw = []
+    try:
+        if level1_filter != "全部" and level1s:
+            # 从 hot_ranking_by_level1 读取
+            res = client.table("hot_ranking_by_level1") \
+                .select("note_id,title,nickname,rank,source_keyword") \
+                .eq("level1", level1_filter) \
+                .order("rank", desc=False) \
+                .execute()
+            if res.data:
+                for r in res.data:
+                    nid = r["note_id"]
+                    prefix_parts = []
+                    prefix_parts.append("✅" if nid in commented_ids else "🆕")
+                    hot_note_opts_raw.append({
+                        "label": f"{' '.join(prefix_parts)} [#{r['rank']}] {r['title'][:40]} — @{r['nickname']} ({nid})",
+                        "note_id": nid,
+                        "has_comments": nid in commented_ids,
+                        "cos_count": 0,
+                    })
+        else:
+            # 从 hot_ranking_snapshot 读取
+            res = client.table("hot_ranking_snapshot") \
+                .select("note_id,title,nickname,rank_all,cos_image_urls") \
+                .is_("exit_time", "null") \
+                .order("rank_all", desc=False) \
+                .execute()
+            if res.data:
+                for r in res.data:
+                    nid = r["note_id"]
+                    prefix_parts = []
+                    prefix_parts.append("✅" if nid in commented_ids else "🆕")
+                    cos_urls = r.get("cos_image_urls") or []
+                    n_cos = len(cos_urls) if isinstance(cos_urls, list) else 0
+                    if n_cos > 0:
+                        prefix_parts.append(f"🖼️×{n_cos}")
+                    hot_note_opts_raw.append({
+                        "label": f"{' '.join(prefix_parts)} [#{r['rank_all']}] {r['title'][:40]} — @{r['nickname']} ({nid})",
+                        "note_id": nid,
+                        "has_comments": nid in commented_ids,
+                        "cos_count": n_cos,
+                    })
+    except Exception:
+        pass
+
+    _SEL_KEY = "crawl_hot_note_select"
+
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        note_id = st.text_input(
-            "笔记 ID (note_id)",
-            placeholder="粘贴小红书的 note_id，例如 6a37d5ef000000000f01f2b6",
+        only_new = st.checkbox("只显示未爬评论的帖子", value=False, disabled=crawl_running)
+        if hot_note_opts_raw:
+            if only_new:
+                filtered = [o for o in hot_note_opts_raw if not o["has_comments"]]
+            else:
+                filtered = hot_note_opts_raw
+            labels = [""] + [o["label"] for o in filtered]
+            # Reset selection after a crawl finishes
+            if st.session_state.get("_clear_sel"):
+                st.session_state[_SEL_KEY] = ""
+                st.session_state["_clear_sel"] = False
+            selected = st.selectbox(
+                "从热帖快照选择笔记",
+                labels,
+                index=0,
+                disabled=crawl_running,
+                key=_SEL_KEY,
+            )
+            note_id = selected.split("(")[-1].rstrip(")") if selected else ""
+        else:
+            note_id = ""
+        manual_id = st.text_input(
+            "或手动输入笔记 ID",
+            placeholder="粘贴 note_id",
             disabled=crawl_running,
+            key="manual_note_id",
         )
+        note_id = manual_id or note_id
     with col2:
         max_comments = st.slider("最大评论数", 10, 200, 200, step=10, disabled=crawl_running)
 
@@ -217,95 +382,203 @@ with tab4:
             disabled=(not enable_proxy or crawl_running),
         )
 
-    if st.button("🚀 启动爬取", type="primary", disabled=(not note_id or crawl_running), use_container_width=True):
-        # Fetch xsec_token from Supabase
-        with st.spinner("查询笔记信息..."):
+    if st.button("🚀 启动详情爬取", type="primary", disabled=(not note_id or crawl_running), use_container_width=True):
+        _launch_detail_crawl(note_id, max_comments, enable_proxy, proxy_provider)
+        st.session_state["_clear_sel"] = True
+        st.rerun()
+
+    # ======== 关键词搜索爬取 ========
+    st.divider()
+    st.subheader("🔍 关键词搜索爬取")
+
+    kw_col1, kw_col2, kw_col3 = st.columns(3)
+    with kw_col1:
+        keywords = st.text_input("搜索关键词", placeholder="例如: 原创车贴", disabled=crawl_running)
+    with kw_col2:
+        kw_notes = st.slider("爬取笔记数", 5, 300, 20, step=5, disabled=crawl_running)
+    with kw_col3:
+        kw_comments = st.slider("每笔记评论数", 0, 200, 0, step=10, disabled=crawl_running)
+
+    if st.button("🔍 启动关键词爬取", type="primary", disabled=(not keywords or crawl_running), use_container_width=True):
+        _launch_keyword_crawl(keywords, kw_notes, kw_comments, enable_proxy, proxy_provider)
+        st.rerun()
+
+    # ======== OpenCLI 图片下载 ========
+    st.divider()
+    st.subheader("📸 OpenCLI 图片下载")
+
+    img_note_id = ""
+    if hot_note_opts_raw:
+        img_labels = [""] + [o["label"] for o in hot_note_opts_raw]
+        img_selected = st.selectbox(
+            "从热帖快照选择笔记",
+            img_labels, index=0,
+            disabled=crawl_running,
+            key="img_note_select",
+        )
+        if img_selected:
+            img_note_id = img_selected.split("(")[-1].rstrip(")")
+    manual_img = st.text_input(
+        "或手动输入笔记 URL / note_id",
+        placeholder="粘贴完整URL或note_id",
+        disabled=crawl_running, key="manual_img_id",
+    )
+
+    output_dir = st.text_input(
+        "输出目录", value=os.path.expanduser("~/Desktop/xhs_images"),
+        disabled=crawl_running, key="opencli_output",
+    )
+
+    auto_upload_cos = st.checkbox(
+        "下载完成后自动上传 COS 并回写 hot_ranking_snapshot",
+        value=True, disabled=crawl_running, key="auto_upload_cos",
+        help="要求该 note_id 已存在于 hot_ranking_snapshot，否则不允许下载",
+    )
+
+    manual_target = manual_img or img_note_id
+    if auto_upload_cos and manual_target:
+        check_nid = (
+            manual_target.split("/explore/")[-1].split("?")[0]
+            if manual_target.startswith("http") else manual_target
+        )
+        try:
+            check_res = client.table("hot_ranking_snapshot") \
+                .select("note_id") \
+                .eq("note_id", check_nid) \
+                .execute()
+            if not check_res.data:
+                st.warning(
+                    f"⚠️ `{check_nid}` 不在 hot_ranking_snapshot 表里，"
+                    "开启「自动上传 COS」时不允许下载。先保存热门快照，或取消勾选。"
+                )
+        except Exception:
+            pass
+
+    if st.button(
+        "📸 下载图片", type="primary",
+        disabled=(not manual_target or crawl_running),
+        use_container_width=True,
+    ):
+        if manual_target.startswith("http"):
+            nid = manual_target.split("/explore/")[-1].split("?")[0]
+        else:
+            nid = manual_target
+
+        if auto_upload_cos:
             try:
-                res = client.table("xhs_note").select("note_id,xsec_token,title,nickname").eq("note_id", note_id).execute()
-                note_data = res.data[0] if res.data else None
+                check_res = client.table("hot_ranking_snapshot") \
+                    .select("note_id") \
+                    .eq("note_id", nid) \
+                    .execute()
+                if not check_res.data:
+                    st.error(
+                        f"❌ `{nid}` 不在 hot_ranking_snapshot 表里，无法启动下载。"
+                        "请先保存热门快照再试。"
+                    )
+                    st.stop()
             except Exception as e:
-                st.error(f"查询 Supabase 失败: {e}")
+                st.error(f"❌ 校验 hot_ranking_snapshot 失败: {e}")
                 st.stop()
 
-        if not note_data:
-            st.error(f"未找到笔记 `{note_id}`，请先通过 CSV 导入或搜索爬取入库")
-            st.stop()
-
-        xsec_token = note_data.get("xsec_token", "")
-        if xsec_token:
-            url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source=pc_search"
-        else:
-            url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_source=pc_search"
-
-        title = str(note_data.get("title", ""))[:60]
-        nickname = note_data.get("nickname", "")
-
-        st.info(f"**目标**: [{title}]({url}) — @{nickname}")
-
-        # Build command
-        cmd = [
-            MEDIACRAWLER_PYTHON, "main.py",
-            "--platform", "xhs",
-            "--lt", "cookie",
-            "--type", "detail",
-            "--specified_id", url,
-            "--get_comment", "true",
-            "--get_sub_comment", "false",
-            "--save_data_option", "postgres",
-            "--max_comments_count_singlenotes", str(max_comments),
-            "--crawler_max_notes_count", "1",
-            "--max_concurrency_num", "1",
-        ]
-
-        if enable_proxy:
-            cmd.extend([
-                "--enable_ip_proxy", "true",
-                "--ip_proxy_provider_name", proxy_provider,
-            ])
-
-        # Prepare log file
-        os.makedirs(CRAWL_LOG_DIR, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(CRAWL_LOG_DIR, f"crawl_{note_id[:12]}_{timestamp}.log")
-
-        with open(log_path, "w") as log_file:
-            log_file.write(f"=== MediaCrawler 爬取任务 ===\n")
-            log_file.write(f"Note ID: {note_id}\nURL: {url}\nMax Comments: {max_comments}\n")
-            log_file.write(f"启动时间: {datetime.datetime.now()}\nCMD: {' '.join(cmd)}\n")
-            log_file.write("=" * 50 + "\n\n")
-
-            process = subprocess.Popen(
-                cmd,
-                cwd=MEDIACRAWLER_DIR,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
-
-        st.session_state.last_crawl = {
-            "note_id": note_id,
-            "title": title,
-            "nickname": nickname,
-            "url": url,
-            "max_comments": max_comments,
-            "log_path": log_path,
-            "pid": process.pid,
-            "started_at": timestamp,
-        }
-
-        st.success(f"✅ 爬虫已启动 (PID: {process.pid})")
-        st.caption(f"日志文件: `{log_path}`")
-
-    # Show last crawl info
-    if "last_crawl" in st.session_state:
-        lc = st.session_state.last_crawl
-        st.divider()
-        st.caption("**上次爬取任务**")
-        st.json({
-            "note_id": lc["note_id"],
-            "标题": lc.get("title", ""),
-            "作者": lc.get("nickname", ""),
-            "评论上限": lc["max_comments"],
-            "PID": lc["pid"],
-            "启动时间": lc["started_at"],
-            "日志文件": lc["log_path"],
+        cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "download_images.py"),
+               "--note-id", nid, "--output-dir", output_dir]
+        pid, log_path = _run_crawl(cmd, nid[:12], extra_info={
+            "title": f"图片下载: {nid}", "nickname": "",
+            "max_comments": 0, "type": "opencli",
+            "auto_upload_cos": auto_upload_cos,
+            "target_note_id": nid,
         })
+        st.success(f"✅ OpenCLI 已启动 (PID: {pid}) → {output_dir}")
+        st.rerun()
+
+    # ======== 爬取状态 + 实时日志（自动刷新） ========
+    @st.fragment(run_every=3)
+    def _render_crawl_status():
+        if "last_crawl" not in st.session_state:
+            return
+        lc = st.session_state.last_crawl
+        pid = lc.get("pid")
+
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+
+        st.divider()
+        st.subheader("📡 爬取状态")
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            if alive:
+                st.success("🟢 运行中")
+            else:
+                st.info("🔴 已结束")
+        with col_b:
+            st.metric("PID", pid or "-")
+        with col_c:
+            st.metric("评论上限", lc.get("max_comments", 0))
+
+        st.caption(f"📌 笔记: **{str(lc.get('title',''))[:50]}** — @{lc.get('nickname','')}")
+        st.caption(f"🕐 启动: {lc.get('started_at','')} | 📄 日志: `{lc.get('log_path','')}`")
+
+        log_path = lc.get("log_path", "")
+        if log_path and os.path.exists(log_path):
+            try:
+                with open(log_path, "r") as f:
+                    lines = f.readlines()
+                tail = lines[-80:] if len(lines) > 80 else lines
+                with st.expander(f"📄 实时日志（最近 {len(tail)} 行 / 共 {len(lines)} 行）", expanded=alive):
+                    st.code("".join(tail), language="log")
+            except Exception:
+                pass
+
+        if not alive:
+            st.success("✅ 爬取任务已结束，可发起新任务")
+
+            if (
+                lc.get("type") == "opencli"
+                and lc.get("auto_upload_cos")
+                and not lc.get("upload_triggered")
+                and not lc.get("upload_result")
+            ):
+                target_nid = lc.get("target_note_id")
+                if target_nid:
+                    st.session_state.last_crawl["upload_triggered"] = True
+                    with st.spinner(f"📤 自动上传 COS + 回写: {target_nid[:12]}..."):
+                        try:
+                            proc = subprocess.run(
+                                [
+                                    sys.executable,
+                                    "scripts/upload_to_cos.py",
+                                    "--include-videos",
+                                    "--note-id", target_nid,
+                                ],
+                                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                capture_output=True, text=True, timeout=300,
+                            )
+                            st.session_state.last_crawl["upload_result"] = {
+                                "returncode": proc.returncode,
+                                "stdout": proc.stdout[-2000:],
+                                "stderr": proc.stderr[-1000:],
+                            }
+                        except Exception as e:
+                            st.session_state.last_crawl["upload_result"] = {
+                                "returncode": -1,
+                                "stdout": "",
+                                "stderr": str(e),
+                            }
+                    st.rerun()
+
+            ur = lc.get("upload_result")
+            if ur:
+                if ur["returncode"] == 0:
+                    st.success("✅ COS 上传 + 回写完成")
+                else:
+                    st.error(f"❌ COS 上传 / 回写失败 (rc={ur['returncode']})")
+                with st.expander("📄 upload_to_cos.py 输出", expanded=(ur["returncode"] != 0)):
+                    st.code(ur["stdout"] + ("\n[stderr]\n" + ur["stderr"] if ur["stderr"] else ""))
+
+    _render_crawl_status()

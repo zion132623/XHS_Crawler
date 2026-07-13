@@ -207,6 +207,7 @@ with st.sidebar:
     if st.button("🔄 刷新热帖排行", use_container_width=True):
         client = st.session_state.get("db_conn") or db.connect()
         with st.spinner("重新计算热帖..."):
+            # 刷新全量榜单
             df_all = db.query_hot_posts(client)
             df_normal = db.query_hot_posts(client, post_type="normal")
             df_video = db.query_hot_posts(client, post_type="video")
@@ -214,12 +215,36 @@ with st.sidebar:
                 db.save_hot_ranking(client, df_all, df_normal, df_video)
             except Exception as e:
                 st.warning(f"写表失败: {e}")
+
+            # 刷新各一级分类榜单
+            level1s, _ = db.get_all_levels(client)
+            level1_hot_map = {}
+            for l1 in level1s:
+                kw_list = db.get_keywords_by_level1(client, l1)
+                if not kw_list:
+                    continue
+                kw_set = set(kw_list)
+                df_level1 = st.session_state.xhs_note[
+                    st.session_state.xhs_note["source_keyword"].fillna("").apply(
+                        lambda x: bool(set(k.strip() for k in str(x).split(",") if k.strip()) & kw_set)
+                    )
+                ].copy()
+                if not df_level1.empty:
+                    df_hot = db.calc_hot_posts(client, df_level1, limit=100)
+                    level1_hot_map[l1] = df_hot
+            try:
+                db.save_hot_ranking_by_level1(client, level1_hot_map)
+            except Exception as e:
+                st.warning(f"写分类榜单失败: {e}")
+
             st.session_state.hot_all = df_all
             st.session_state.hot_normal = df_normal
             st.session_state.hot_video = df_video
         st.rerun()
 
     st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
+    st.page_link("pages/keywords.py", label="🏷️ 关键词管理", icon="🏷️")
+    st.page_link("pages/agent.py", label="🤖 AI 运营助手", icon="🤖")
 
     if auth.is_admin():
         st.page_link("pages/admin.py", label="🔧 管理后台", icon="🔧")
@@ -261,11 +286,40 @@ def _render_tab_hot():
         st.warning("暂无热帖数据")
         return
 
-    post_type = st.selectbox("帖子类型", ["全部", "图文 (normal)", "视频 (video)"])
+    client = st.session_state.get("db_conn") or db.connect()
+    level1s, _ = db.get_all_levels(client)
 
-    df_hot = hot_mod.filter_hot_df(st.session_state, post_type)
+    col_filter1, col_filter2 = st.columns(2)
+    with col_filter1:
+        post_type = st.selectbox("帖子类型", ["全部", "图文 (normal)", "视频 (video)"])
+    with col_filter2:
+        level1_selected = st.selectbox("一级分类", ["全部"] + level1s if level1s else ["全部"])
+
+    # 一级分类切换时，优先从 hot_ranking_by_level1 表读取，兜底实时计算
+    if level1_selected != "全部":
+        # 尝试从已存储的分类榜单读取
+        df_hot = db.load_hot_ranking_by_level1(client, level1_selected)
+        if df_hot.empty:
+            # 兜底：实时计算
+            kw_list = db.get_keywords_by_level1(client, level1_selected)
+            if not kw_list:
+                st.warning(f"⚠️ 一级分类「{level1_selected}」在关键词库中暂无关键词，请去 🏷️ 关键词管理 添加后再试。")
+                st.stop()
+            kw_set = set(kw_list)
+            df_level1 = st.session_state.xhs_note[
+                st.session_state.xhs_note["source_keyword"].fillna("").apply(
+                    lambda x: bool(set(k.strip() for k in str(x).split(",") if k.strip()) & kw_set)
+                )
+            ].copy()
+            if df_level1.empty:
+                st.warning(f"该分类暂无帖子")
+                st.stop()
+            df_hot = db.calc_hot_posts(client, df_level1, limit=100)
+    else:
+        df_hot = hot_mod.filter_hot_df(st.session_state, post_type)
+
     if df_hot.empty:
-        st.warning(f"该类型暂无帖子")
+        st.warning(f"该条件暂无帖子")
         st.stop()
 
     col1, col2, col3, col4 = st.columns(4)
@@ -283,7 +337,7 @@ def _render_tab_hot():
         st.info("暂无关键词数据")
 
     # Multi-keyword posts from ALL notes
-    multi_df, multi_count, total_count = hot_mod.build_multi_kw_table(df)
+    multi_df, multi_count, total_count = hot_mod.build_multi_kw_table(df_hot)
     st.markdown(f"🔗 **多关键词帖子 · 全部** ({multi_count} / {total_count})")
     if multi_count > 0:
         st.dataframe(
@@ -340,7 +394,9 @@ def _render_tab_hot():
     sort_map = {"综合榜": "final_score", "热门榜": "hot_score", "潜力榜": "score_burst"}
     sort_col = sort_map[view_mode]
 
+    # 排行榜展示（取前20条）
     display = df_hot.sort_values(sort_col, ascending=False).head(20)
+
 
     col_left, col_right = st.columns([1.2, 1])
 
@@ -836,3 +892,4 @@ with tab_peers:
 
 with tab_comments:
     _render_tab_safe("💬 评论分析", _render_tab_comments)
+
