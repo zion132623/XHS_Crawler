@@ -244,7 +244,7 @@ with st.sidebar:
 
     st.page_link("pages/stopwords.py", label="📝 停用词管理", icon="📝")
     st.page_link("pages/keywords.py", label="🏷️ 关键词管理", icon="🏷️")
-    st.page_link("pages/agent.py", label="🤖 AI 运营助手", icon="🤖")
+    st.page_link("pages/media.py", label="📸 Media 画廊", icon="📸")
 
     if auth.is_admin():
         st.page_link("pages/admin.py", label="🔧 管理后台", icon="🔧")
